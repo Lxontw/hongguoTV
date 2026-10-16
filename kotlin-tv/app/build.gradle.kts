@@ -6,11 +6,12 @@ fun signingValue(env: String, key: String): String? = System.getenv(env) ?: sign
 
 android {
     namespace = "com.hongguotv.nativeapp"
-    compileSdk = 36
+    compileSdk = 34
+    buildToolsVersion = "34.0.0"
     defaultConfig {
         applicationId = "com.hongguotv.nativeapp"
         minSdk = 26
-        targetSdk = 36
+        targetSdk = 34
         versionCode = System.getenv("HONGGUOTV_VERSION_CODE")?.toInt() ?: 9
         versionName = System.getenv("HONGGUOTV_VERSION_NAME") ?: "0.9.0"
     }
@@ -34,6 +35,6 @@ dependencies {
     coreLibraryDesugaring("com.android.tools:desugar_jdk_libs_nio:2.1.5")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation(project(":core")) { exclude(group = "org.json") }
-    implementation("androidx.media3:media3-exoplayer:1.8.0")
-    implementation("androidx.media3:media3-ui:1.8.0")
+    implementation("androidx.media3:media3-exoplayer:1.3.1")
+    implementation("androidx.media3:media3-ui:1.3.1")
 }

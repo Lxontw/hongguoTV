@@ -12,6 +12,7 @@ import android.graphics.drawable.GradientDrawable
 import android.view.*
 import android.view.inputmethod.InputMethodManager
 import android.content.Context
+import android.content.Intent
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
@@ -205,12 +206,29 @@ class MainActivity: Activity() {
     private fun showLibraryError(problem: Throwable) {
         val body=base(); error(body,problem) { message(base(),"正在读取本机记录…"); loadLibrary() }
     }
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleIntent(intent)
+    }
+    private fun handleIntent(intent: Intent?) {
+        val searchQuery = intent?.getStringExtra("search")?.trim().orEmpty()
+        if (searchQuery.isNotEmpty() && library.isLoaded) {
+            val typeStr = intent?.getStringExtra("type")?.lowercase()
+            val targetType = if (typeStr == "comic") ContentType.COMIC else ContentType.SHORT
+            runSearch(searchQuery, targetType)
+        }
+    }
     private fun loadLibrary() {
         libraryLoadError=null
         library.loadAsync(onFailure={ problem ->
             if(!isDestroyed) { libraryLoadError=problem; if(foreground) showLibraryError(problem) }
         }) {
-            if(!isDestroyed && foreground) { showCatalog(load=true); favoriteMonitor.check() }
+            if(!isDestroyed && foreground) {
+                showCatalog(load=true)
+                favoriteMonitor.check()
+                handleIntent(intent)
+            }
         }
     }
     private fun base(title: String?=null): LinearLayout {
@@ -272,7 +290,7 @@ class MainActivity: Activity() {
     private fun message(parent: LinearLayout,label: String) { parent.addView(text(label,17f,muted).apply { setPadding(0,dp(28),0,dp(18)) }) }
     private fun error(parent: LinearLayout,problem: Throwable,retry: ()->Unit) {
         message(parent,"暂时无法加载，请检查网络后重试。")
-        val detail=if(problem is java.net.UnknownHostException) "无法连接内容网站" else if(problem is java.net.SocketTimeoutException) "连接超时" else problem.message.orEmpty().replace(Regex("https?://\\S+"),"[地址]").take(160)
+        val detail=if(problem is java.net.UnknownHostException) "无法连接内容网站" else if(problem is java.net.SocketTimeoutException) "连接超时" else if(problem is org.json.JSONException) "内容解析异常" else problem.message.orEmpty().replace(Regex("https?://\\S+"),"[地址]").take(160)
         parent.addView(text(detail,13f,muted)); addButton(parent,"重试",onClick=retry).requestFocus()
     }
     private fun switchTab(next: Int) {

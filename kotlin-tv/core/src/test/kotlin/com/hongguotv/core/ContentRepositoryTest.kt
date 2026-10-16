@@ -244,4 +244,21 @@ class ContentRepositoryTest {
         assertEquals("456",repo.search("短剧",1,ContentType.SHORT).items.single().id)
         assertEquals(2,paths.size)
     }
+
+    @Test fun traditionalChineseSearchIsConvertedToSimplified() {
+        var queryReceived=""
+        val repo=repository { request ->
+            queryReceived=request.url.queryParameter("query").orEmpty()
+            JSONObject().put("code",0).put("search_tabs",JSONArray().put(searchTab(11,"123"))).toString()
+        }
+        repo.search("戰神總裁開局神醫",1,ContentType.SHORT)
+        assertEquals("战神总裁开局神医",queryReceived)
+    }
+
+    @Test fun emptyAppSearchPayloadThrowsIOExceptionNotJSONExceptionAtZero() {
+        val repo=repository { "" }
+        val problem=assertThrows(IOException::class.java) { repo.search("修仙",1,ContentType.COMIC) }
+        assertFalse(problem is org.json.JSONException)
+        assertEquals("搜索接口暂不可用",problem.message)
+    }
 }

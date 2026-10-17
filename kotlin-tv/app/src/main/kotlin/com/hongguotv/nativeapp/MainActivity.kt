@@ -37,6 +37,9 @@ class MainActivity: Activity() {
     private val prefetchWorker=Executors.newSingleThreadExecutor()
     private var prefetchHttp: okhttp3.OkHttpClient?=null
     private var playbackHttp: okhttp3.OkHttpClient?=null
+    private var queuedHttp: okhttp3.OkHttpClient?=null
+    private var queuedVideo: RemoteVideo?=null
+    private var queuedEpisodeId=""
     private val preparedNext=PreparedSlot<RemoteVideo>({ android.os.SystemClock.elapsedRealtime() })
     private var prefetchJob: java.util.concurrent.Future<*>?=null
     private var prefetchScope: RequestScope?=null
@@ -701,6 +704,11 @@ class MainActivity: Activity() {
             library.autoNext=!library.autoNext
             autoNextButton.text="自动连播  ·  ${if(library.autoNext) "开启" else "关闭"}"
         }
+        lateinit var seamlessNextButton: TextView
+        seamlessNextButton=setting(playback,"无缝换集  ·  ${if(library.seamlessNext) "开启" else "关闭"}") {
+            library.seamlessNext=!library.seamlessNext
+            seamlessNextButton.text="无缝换集  ·  ${if(library.seamlessNext) "开启" else "关闭"}"
+        }
         lateinit var backup: TextView
         backup=setting(device,"手机备份与恢复") {
             runCatching { LibraryBackup.encode(library.snapshot()) }.onSuccess { encoded ->
@@ -721,13 +729,13 @@ class MainActivity: Activity() {
         val license=setting(device,"开源许可") {
             AlertDialog.Builder(this).setTitle("开源许可").setMessage("本原生版以 GPL-3.0 发布。\n内容协议与加密处理移植自 drpys（22261ad）。\nAndroidX Media3 / OkHttp：Apache-2.0\nKotlin：Apache-2.0\nBouncy Castle：MIT\n完整源码和许可证见 GitHub：N3urda/hongguoTV-updates。").setPositiveButton("关闭",null).show()
         }
-        val left=listOf(qualityButton,defaultSpeed,frame,autoNextButton); val right=listOf(backup,hidden,updates,license)
+        val left=listOf(qualityButton,defaultSpeed,frame,autoNextButton,seamlessNextButton); val right=listOf(backup,hidden,updates,license)
         listOf(left,right).forEach { items -> items.forEachIndexed { index,view ->
             view.nextFocusUpId=items.getOrNull(index-1)?.id ?: nav[tab].id
             view.nextFocusDownId=items.getOrNull(index+1)?.id ?: view.id
         } }
-        left.forEachIndexed { i,v -> v.nextFocusLeftId=v.id; v.nextFocusRightId=right[i].id }
-        right.forEachIndexed { i,v -> v.nextFocusLeftId=left[i].id; v.nextFocusRightId=v.id }
+        left.forEachIndexed { i,v -> v.nextFocusLeftId=v.id; v.nextFocusRightId=right.getOrNull(i)?.id ?: right.last().id }
+        right.forEachIndexed { i,v -> v.nextFocusLeftId=left.getOrNull(i)?.id ?: left.last().id; v.nextFocusRightId=v.id }
         nav.forEach { it.nextFocusDownId=qualityButton.id }
         parent.addView(text("红果 TV  /  ${BuildConfig.VERSION_NAME}    ·    收藏与进度保存在本机",12f,muted).apply { setPadding(dp(2),dp(18),0,dp(10)) })
         nav[tab].requestFocus()
@@ -878,8 +886,40 @@ class MainActivity: Activity() {
                 }
             }
             p.setPlaybackSpeed(library.playbackSpeed)
+            var currentMediaId=requestedId
             val listener=object: Player.Listener {
-                private fun active()=player===p && generation==ticket && p.currentMediaItem?.mediaId==requestedId
+                private fun active()=player===p && generation==ticket && p.currentMediaItem?.mediaId==currentMediaId
+                override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
+                    val d=detail ?: return
+                    if(player!==p || generation!=ticket) return
+                    if(mediaItem!=null && episodeIndex<d.episodes.lastIndex && mediaItem.mediaId==d.episodes[episodeIndex+1]) {
+                        val nextIndex=episodeIndex+1
+                        android.util.Log.i("HongguoTV","Seamless transition triggered to episode ${nextIndex+1}")
+                        saveProgress(true)
+                        episodeIndex=nextIndex
+                        currentMediaId=mediaItem.mediaId
+                        group=episodeIndex/20
+                        library.setWatched(d.series.id,false)
+                        video?.close()
+                        closeTransport(playbackHttp)
+                        video=queuedVideo
+                        playbackHttp=queuedHttp
+                        queuedVideo=null
+                        queuedHttp=null
+                        queuedEpisodeId=""
+                        if(p.mediaItemCount>1) p.removeMediaItem(0)
+                        playbackTitle.text="${d.series.title}  ·  第 ${episodeIndex+1} 集"
+                        playbackText.text=""
+                        progressBar.progress=0
+                        hidePlaybackOverlay()
+                        syncMediaSession()
+                        prefetchAttempts=0
+                        prefetchAttemptAt=0
+                        readySince=android.os.SystemClock.elapsedRealtime()
+                        firstReady=true
+                        firstFrame=true
+                    }
+                }
                 override fun onPlaybackStateChanged(state: Int) {
                     if(!active()) return
                     if(state==Player.STATE_READY) {
@@ -924,13 +964,32 @@ class MainActivity: Activity() {
         prefetchScope?.cancel(); prefetchScope=null
         preparedNext.clear(); prefetchJob?.cancel(true); prefetchJob=null
         closeTransport(prefetchHttp); prefetchHttp=null; prefetchedFor=""
+        queuedVideo?.close(); queuedVideo=null
+        closeTransport(queuedHttp); queuedHttp=null; queuedEpisodeId=""
+    }
+    private fun enqueueSeamlessNext(id: String, remote: RemoteVideo, http: okhttp3.OkHttpClient) {
+        val p=player ?: return; val data=detail ?: return
+        if(!foreground || screen!="player" || playError || episodeIndex>=data.episodes.lastIndex) return
+        if(data.episodes[episodeIndex+1]!=id) return
+        if(p.mediaItemCount<=1) {
+            queuedVideo?.close()
+            closeTransport(queuedHttp)
+            queuedVideo=remote
+            queuedHttp=http
+            queuedEpisodeId=id
+            val source=ProgressiveMediaSource.Factory { VideoDataSource(remote) }
+                .createMediaSource(MediaItem.Builder().setMediaId(id).setUri("hongguotv://episode/$id").setMimeType(MimeTypes.VIDEO_MP4).build())
+            p.addMediaSource(source)
+            android.util.Log.i("HongguoTV","Seamless next episode added to player playlist: $id")
+        }
     }
     private fun maybePrefetch() {
         val p=player ?: return; val data=detail ?: return
         if(!foreground || !p.isPlaying || !library.autoNext || playError || sleepStopped || episodeIndex>=data.episodes.lastIndex) return
-        if(!PrefetchPolicy.nearEnd(p.currentPosition,p.duration,p.playbackParameters.speed)) return
+        val shouldPrefetch=if(library.seamlessNext) true else PrefetchPolicy.nearEnd(p.currentPosition,p.duration,p.playbackParameters.speed)
+        if(!shouldPrefetch) return
         val id=data.episodes[episodeIndex+1]; val quality=library.maxQuality; val key="$id:$quality"
-        if(preparedNext.isFresh(key) || prefetchJob?.isDone==false) return
+        if(preparedNext.isFresh(key) || prefetchJob?.isDone==false || (library.seamlessNext && queuedEpisodeId==id && p.mediaItemCount>1)) return
         val now=android.os.SystemClock.elapsedRealtime()
         if(readySince==0L || now-readySince<3000 || p.bufferedPosition-p.currentPosition<5000) return
         if(prefetchAttempts>=3 || (prefetchAttempts>0 && now-prefetchAttemptAt<15_000) || connectivity.isActiveNetworkMetered || !networkAvailable()) return
@@ -945,7 +1004,16 @@ class MainActivity: Activity() {
                 val prepared=scope.run {
                     RemoteVideo(http,source.stream(id,quality)).also { remote=it; it.warm() }
                 }
-                if(preparedNext.complete(ticket,key,prepared)) android.util.Log.i("HongguoTV","Next episode prepared near end")
+                if(preparedNext.complete(ticket,key,prepared)) {
+                    android.util.Log.i("HongguoTV","Next episode prepared near end")
+                    if(library.seamlessNext) {
+                        main.post {
+                            if(foreground && screen=="player" && !isDestroyed) {
+                                enqueueSeamlessNext(id,prepared,http)
+                            }
+                        }
+                    }
+                }
             } catch(_: Exception) { remote?.close() }
         }
     }
@@ -1018,7 +1086,14 @@ class MainActivity: Activity() {
         if(!foreground || screen!="player") return
         val count=detail?.episodes?.size ?: return
         val target=episodeIndex+direction
-        if(target in 0 until count) playEpisode(target)
+        if(target in 0 until count) {
+            val p=player
+            if(direction==1 && library.seamlessNext && p!=null && p.mediaItemCount>1) {
+                p.seekToNextMediaItem()
+            } else {
+                playEpisode(target)
+            }
+        }
     }
     private fun syncMediaSession() {
         if(!foreground || screen!="player") { mediaSession.deactivate(); return }

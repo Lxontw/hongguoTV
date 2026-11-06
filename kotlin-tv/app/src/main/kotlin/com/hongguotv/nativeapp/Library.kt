@@ -130,6 +130,17 @@ class Library(context: Context) {
     fun clearSearches() { state().clearSearches(); persist("searches") }
     fun removeHistory(id: String) { state().removeHistory(id); persist("progress", "watched") }
     fun clearHistory() { state().clearHistory(); persist("progress", "watched") }
+    fun deviceRegistered(): Boolean =
+        prefs.getString("registered-device-id", null)?.isNotBlank() == true &&
+        prefs.getString("registered-install-id", null)?.isNotBlank() == true
+    fun deviceIdentity(): Map<String, String> {
+        val did = prefs.getString("registered-device-id", null)?.takeIf { it.isNotBlank() } ?: return emptyMap()
+        val iid = prefs.getString("registered-install-id", null)?.takeIf { it.isNotBlank() } ?: return emptyMap()
+        return linkedMapOf("device_id" to did, "iid" to iid)
+    }
+    fun saveDeviceIdentity(deviceId: String, installId: String) {
+        prefs.edit().putString("registered-device-id", deviceId).putString("registered-install-id", installId).apply()
+    }
     fun observeFavorite(id: String, count: Int, now: Long, acknowledge: Boolean = false) {
         if (state().observeFavorite(id, count, now, acknowledge)) persist("favoriteUpdates")
     }

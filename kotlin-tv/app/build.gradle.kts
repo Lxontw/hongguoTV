@@ -12,19 +12,32 @@ android {
         applicationId = "com.hongguotv.nativeapp"
         minSdk = 26
         targetSdk = 34
-        versionCode = System.getenv("HONGGUOTV_VERSION_CODE")?.toInt() ?: 9
-        versionName = System.getenv("HONGGUOTV_VERSION_NAME") ?: "0.9.0"
+        versionCode = System.getenv("HONGGUOTV_VERSION_CODE")?.toInt() ?: 16
+        versionName = System.getenv("HONGGUOTV_VERSION_NAME") ?: "0.9.07"
     }
     buildFeatures { buildConfig = true }
     signingConfigs {
         create("delivery") {
-            storeFile = signingValue("HONGGUOTV_KEYSTORE", "storeFile")?.let { file(it) }
+            storeFile = signingValue("HONGGUOTV_KEYSTORE", "storeFile")?.let { path ->
+                file(path).takeIf { it.exists() } ?: rootProject.file(path)
+            }
             storePassword = signingValue("HONGGUOTV_STORE_PASSWORD", "storePassword")
             keyAlias = signingValue("HONGGUOTV_KEY_ALIAS", "keyAlias")
             keyPassword = signingValue("HONGGUOTV_KEY_PASSWORD", "keyPassword")
         }
     }
-    buildTypes { getByName("release") { signingConfig = signingConfigs.getByName("delivery"); isMinifyEnabled = true; proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro") } }
+    buildTypes {
+        getByName("debug") {
+            if (signingConfigs.getByName("delivery").storeFile?.exists() == true) {
+                signingConfig = signingConfigs.getByName("delivery")
+            }
+        }
+        getByName("release") {
+            signingConfig = signingConfigs.getByName("delivery")
+            isMinifyEnabled = true
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+        }
+    }
     compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17; isCoreLibraryDesugaringEnabled = true }
     kotlinOptions { jvmTarget = "17" }
     packaging { resources.excludes += setOf("META-INF/versions/**", "META-INF/*.kotlin_module") }

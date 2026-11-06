@@ -13,47 +13,152 @@ import java.util.concurrent.TimeUnit
 internal fun JSONArray.objects() = (0 until length()).mapNotNull { optJSONObject(it) }
 internal fun JSONObject.str(key: String) = if (isNull(key)) "" else optString(key, "").trim()
 internal fun cleanUrl(s: String) = s.replace("\\/","/").replace("\\u002F","/",ignoreCase=true).replace("\\u0026","&").replace("&amp;","&")
-data class Series(val id: String, val title: String, val cover: String = "", val description: String = "", val badge: String = "", val tags: String = "") {
+data class Series(val id: String, val title: String, val cover: String = "", val description: String = "", val badge: String = "", val tags: String = "", val isAi: Boolean? = null, val isLandscape: Boolean? = null) {
     fun toJson() = JSONObject().put("id",id).put("title",title).put("cover",cover).put("description",description).put("badge",badge).put("tags",tags)
-    companion object { fun fromJson(o: JSONObject) = Series(o.str("id"),o.str("title"),o.str("cover"),o.str("description"),o.str("badge"),o.str("tags")) }
+        .apply {
+            if(isAi != null) put("isAi", isAi)
+            if(isLandscape != null) put("isLandscape", isLandscape)
+        }
+    companion object {
+        fun fromJson(o: JSONObject) = Series(
+            o.str("id"), o.str("title"), o.str("cover"), o.str("description"), o.str("badge"), o.str("tags"),
+            if (o.has("isAi")) o.optBoolean("isAi") else null,
+            if (o.has("isLandscape")) o.optBoolean("isLandscape") else null
+        )
+    }
 }
 data class Detail(val series: Series, val episodes: List<String>)
 data class RankPosition(val rank: Int?, val heat: String)
 data class ComicRanking(val positions: Map<String,RankPosition>, val totalPages: Int, val updatedText: String)
 data class CatalogPage(val items: List<Series>, val hasMore: Boolean, val ranking: ComicRanking? = null)
-data class StreamInfo(val url: String, val key: ByteArray?, val quality: String)
+data class StreamInfo(val url: String, val key: ByteArray?, val quality: String, val width: Int = 0, val height: Int = 0)
 class SearchSessionExpiredException: IOException("搜索结果已过期，请从第 1 页重新搜索")
 
 class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectTimeout(15,TimeUnit.SECONDS).readTimeout(30,TimeUnit.SECONDS).callTimeout(45,TimeUnit.SECONDS).build(), private val clock: () -> Long = System::currentTimeMillis) {
-    private val signer = Signer()
+    private val signer = Signer(clock)
     private val site = "https://hongguoduanju.com"
     private data class SearchCursor(val searchId: String, val passback: String, val offset: Int?, val updatedAt: Long)
     private val searchCursors=linkedMapOf<Triple<ContentType,String,Int>,SearchCursor>()
-    private fun text(url: String, signed: Signer.Request? = null): String {
-        val request = Request.Builder().url(url).header("User-Agent",VendorConstants.VIDEO_UA).header("Accept-Language","zh-CN,zh;q=0.9")
-        signed?.headers?.forEach { (k,v) -> request.header(k,v) }
-        signed?.body?.let { request.post(it.toRequestBody("application/json; charset=utf-8".toMediaType())) }
-        return RequestScope.execute(http.newCall(request.build())) { response ->
-            if (!response.isSuccessful) throw IOException("内容请求失败（HTTP ${response.code}）")
-            val body = response.body ?: throw IOException("内容响应为空")
-            if (body.contentLength() > 16*1024*1024) throw IOException("内容响应过大")
-            val input=body.byteStream(); val out=java.io.ByteArrayOutputStream(); val buffer=ByteArray(8192)
-            while(out.size()<=16*1024*1024) { val n=input.read(buffer); if(n<0) break; out.write(buffer,0,n) }; val bytes=out.toByteArray()
-            if(bytes.size > 16*1024*1024) throw IOException("内容响应过大")
-            String(bytes,Charsets.UTF_8)
+
+    @Volatile var deviceIdentity: Map<String,String> = emptyMap()
+        set(value) { field=value.filterValues { it.isNotBlank() }; signer.updateDevice(deviceProfile()) }
+
+    fun inheritDevice(from: ContentRepository) {
+        deviceIdentity=from.deviceIdentity
+        registrationCookies=from.registrationCookies
+    }
+
+    @Volatile var registerProfile: Map<String,String> = emptyMap()
+    @Volatile var onDeviceRegistered: ((DeviceRegister.Registered) -> Unit)? = null
+
+    fun registerDevice(): DeviceRegister.Registered? {
+        val device=LinkedHashMap(registerProfile).apply { putAll(deviceIdentity) }
+        val body=DeviceRegister.payload(device)
+        val headers=DeviceRegister.headers(body,device)
+        val registered=runCatching {
+            val request=Request.Builder().url(DeviceRegister.url())
+            headers.forEach { (key,value) -> request.header(key,value) }
+            request.post(body.toRequestBody("application/octet-stream".toMediaType()))
+            RequestScope.execute(http.newCall(request.build())) { response ->
+                if(!response.isSuccessful) throw IOException("设备注册失败（HTTP ${response.code}）")
+                val bytes=response.body?.bytes() ?: throw IOException("设备注册响应为空")
+                DeviceRegister.parse(String(bytes,Charsets.UTF_8),response.headers("Set-Cookie"))
+                    ?: throw IOException("设备注册被服务端拒绝")
+            }
+        }.getOrNull()
+        if(registered!=null) {
+            deviceIdentity=linkedMapOf("device_id" to registered.deviceId,"iid" to registered.installId)
+            registrationCookies=LinkedHashMap(registrationCookies).apply { putAll(registered.cookies) }
+            onDeviceRegistered?.invoke(registered)
         }
+        return registered
+    }
+
+    @Volatile private var registrationCookies: Map<String,String> = emptyMap()
+        set(value) { field=LinkedHashMap(value) }
+
+    private fun deviceProfile(): Map<String,String> =
+        LinkedHashMap(VendorConstants.device).apply {
+            putAll(deviceIdentity)
+        }
+    private val rankCache = java.util.concurrent.ConcurrentHashMap<Int, Pair<Long, CatalogPage>>()
+    private fun text(url: String, signed: Signer.Request? = null): String {
+        val isWeb = url.startsWith(site)
+        val defaultUa = if (isWeb) VendorConstants.WEB_UA else VendorConstants.VIDEO_UA
+        val maxAttempts = if (isWeb && signed == null) 3 else 1
+        var lastException: IOException? = null
+
+        for (attempt in 1..maxAttempts) {
+            try {
+                val request = Request.Builder().url(url).header("User-Agent", defaultUa)
+                if (isWeb) request.header("Connection", "close")
+                signed?.headers?.forEach { (k, v) -> request.header(k, v) }
+                signed?.body?.let { request.post(it.toRequestBody("application/json; charset=utf-8".toMediaType())) }
+
+                val client = if (isWeb && attempt > 1) {
+                    http.newBuilder().readTimeout(4, TimeUnit.SECONDS).callTimeout(5, TimeUnit.SECONDS).build()
+                } else if (isWeb) {
+                    http.newBuilder().readTimeout(6, TimeUnit.SECONDS).callTimeout(8, TimeUnit.SECONDS).build()
+                } else {
+                    http
+                }
+
+                return RequestScope.execute(client.newCall(request.build())) { response ->
+                    if (!response.isSuccessful) throw IOException("内容请求失败（HTTP ${response.code}）")
+                    val body = response.body ?: throw IOException("内容响应为空")
+                    if (body.contentLength() > 16 * 1024 * 1024) throw IOException("内容响应过大")
+                    val input = body.byteStream()
+                    val out = java.io.ByteArrayOutputStream()
+                    val buffer = ByteArray(8192)
+                    while (out.size() <= 16 * 1024 * 1024) {
+                        val n = input.read(buffer)
+                        if (n < 0) break
+                        out.write(buffer, 0, n)
+                    }
+                    val bytes = out.toByteArray()
+                    if (bytes.size > 16 * 1024 * 1024) throw IOException("内容响应过大")
+                    String(bytes, Charsets.UTF_8)
+                }
+            } catch (e: IOException) {
+                lastException = e
+                if (attempt == maxAttempts) throw e
+            }
+        }
+        throw lastException ?: IOException("内容请求失败")
     }
     private fun router(url: String) = extractRouter(text(url)).getJSONObject("loaderData")
     private fun card(item: JSONObject): Series {
         val o=item.optJSONObject("video_data") ?: item
         val count=o.optInt("episode_cnt",o.optJSONObject("series_episode_info")?.optInt("episode_cnt",0) ?: 0)
         val tags=o.optJSONArray("tags") ?: o.optJSONArray("category_list") ?: JSONArray()
-        return Series(o.str("series_id"),o.str("series_name").ifEmpty { o.str("series_title").ifEmpty { item.str("name") } },cleanUrl(o.str("series_cover")),o.str("series_intro"),o.str("episode_right_text").ifEmpty { if(count>0) "全 ${count} 集" else "" },(0 until minOf(tags.length(),5)).joinToString(" · ") { tags.optJSONObject(it)?.str("name") ?: tags.optString(it) })
+        val vertical = if(o.has("vertical")) o.optBoolean("vertical") else null
+        val isLandscape = if(vertical != null) !vertical else null
+        val detailObj = o.optJSONObject("video_detail")
+        val aiUsage = o.optInt("ai_usage_type", detailObj?.optInt("ai_usage_type", 0) ?: 0)
+        val isAi = if(aiUsage > 0) true else null
+        return Series(
+            o.str("series_id"),
+            o.str("series_name").ifEmpty { o.str("series_title").ifEmpty { item.str("name") } },
+            cleanUrl(o.str("series_cover")),
+            o.str("series_intro"),
+            o.str("episode_right_text").ifEmpty { if(count>0) "全 ${count} 集" else "" },
+            (0 until minOf(tags.length(),5)).joinToString(" · ") { tags.optJSONObject(it)?.str("name") ?: tags.optString(it) },
+            isAi = isAi,
+            isLandscape = isLandscape
+        ).also(SeriesMediaTrait::recordSeriesMetadata)
     }
     private fun valid(rows: List<Series>) = rows.filter { it.id.matches(Regex("[0-9]{1,30}")) && it.title.isNotBlank() }.distinctBy { it.id }
     fun comicRanking(page: Int = 1): CatalogPage {
         require(page in 1..100)
-        return ComicRank.parse(text("$site/rank/hot-comic-drama?page=$page"),page)
+        val cached = rankCache[page]
+        val now = clock()
+        if (cached != null && now - cached.first < 300_000L) {
+            return cached.second
+        }
+        val url = if (page > 1) "$site/rank/hot-comic-drama?page=$page" else "$site/rank/hot-comic-drama"
+        val res = ComicRank.parse(text(url), page)
+        rankCache[page] = Pair(now, res)
+        return res
     }
     fun home(page: Int = 1, type: ContentType = ContentType.SHORT): CatalogPage {
         require(page in 1..100)
@@ -88,8 +193,64 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
         val items = valid(rows.objects().map(::card))
         return CatalogPage(items, items.isNotEmpty() && page < 100)
     }
+    fun hotSearches(): List<String> = listOf(
+        "短剧最热榜前十名", "都市逆袭", "战神归来", "甜宠", "神医下山", "穿越剧大全",
+        "萌宝助攻", "豪门千金", "玄幻修仙", "赘婿逆袭", "古装穿越", "重生复仇"
+    )
+
+    fun searchSiblings(series: Series): List<Series> {
+        val parsed = SeriesSeasons.parse(series.title)
+        val base = if (!parsed.matched && (series.title.contains('：') || series.title.contains(':'))) {
+            series.title.substringBefore('：').substringBefore(':').trim().ifEmpty { parsed.base }
+        } else {
+            parsed.base
+        }
+        val list = mutableListOf<Series>()
+        try {
+            val page1 = search(base, 1, ContentType.SHORT)
+            list.addAll(page1.items)
+            if (page1.hasMore) {
+                runCatching { search(base, 2, ContentType.SHORT).items }.getOrNull()?.let { list.addAll(it) }
+            }
+        } catch (_: Exception) {
+        }
+        val initialSiblings = SeriesSeasons.siblings(series.title, (list + series).distinctBy { it.id })
+        val matchedSeasons = initialSiblings.mapNotNull { s ->
+            SeriesSeasons.parse(s.title).takeIf { it.matched }?.season
+        }.toSet()
+        if (parsed.matched || matchedSeasons.size > 1 || (matchedSeasons.maxOrNull() ?: 1) > 1) {
+            val probeTargets = listOf(
+                listOf(2, 3, 4, 5),
+                listOf(6, 7, 8, 9, 10),
+                listOf(11, 12, 13, 14, 15),
+                listOf(16, 17, 18, 19, 20)
+            )
+            for (group in probeTargets) {
+                val missing = group.filter { it !in matchedSeasons }
+                if (missing.isEmpty()) continue
+                val suffixQuery = missing.joinToString(" ") { "第${SeriesSeasons.toChineseNumber(it)}季" }
+                val query = "$base $suffixQuery".take(80)
+                runCatching { search(query, 1, ContentType.SHORT).items }.getOrNull()?.let { list.addAll(it) }
+            }
+            val afterCompound = SeriesSeasons.siblings(series.title, (list + series).distinctBy { it.id })
+            val currentSeasons = afterCompound.mapNotNull { s ->
+                SeriesSeasons.parse(s.title).takeIf { it.matched }?.season
+            }.toSet()
+            val maxKnown = maxOf(currentSeasons.maxOrNull() ?: 1, if (parsed.matched) parsed.season else 1)
+            if (maxKnown > 1) {
+                val stillMissing = (1..(maxKnown + 1).coerceAtMost(25)).filter { it !in currentSeasons }.take(6)
+                for (num in stillMissing) {
+                    val q = "${base}第${SeriesSeasons.toChineseNumber(num)}季".take(80)
+                    runCatching { search(q, 1, ContentType.SHORT).items }.getOrNull()?.let { list.addAll(it) }
+                }
+            }
+        }
+        val all = (list + series).distinctBy { it.id }
+        return SeriesSeasons.siblings(series.title, all)
+    }
+
     private fun appSearch(keyword: String, page: Int, type: ContentType): CatalogPage {
-        val values=VendorConstants.device.toMutableMap()
+        val values=LinkedHashMap(deviceProfile())
         for(k in listOf("version_code","manifest_version_code","update_version_code","pv_player")) values[k]="72232"
         values["version_name"]="7.2.2.32"
         values.putAll(linkedMapOf("query" to keyword,"count" to "20","offset" to ((page-1)*20).toString(),"tab_type" to type.searchTab.toString(),"bookshelf_search_plan" to "4","use_correct" to "true","user_is_login" to "0"))
@@ -120,7 +281,24 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
                 val id=video.str("series_id").ifEmpty { row.str("book_id").ifEmpty { row.str("search_result_id") } }
                 val title=row.optJSONObject("search_high_light")?.optJSONObject("title")?.str("text").orEmpty().ifEmpty { video.str("title").ifEmpty { row.str("cell_name") } }
                 val count=video.optInt("episode_cnt")
-                list+=Series(id,title,cleanUrl(video.str("cover").ifEmpty { video.str("cover_url") }),video.str("video_desc"),if(count>0) "全 $count 集" else video.str("rec_text"),video.str("sub_title"))
+                val vertical=if(video.has("vertical")) video.optBoolean("vertical") else null
+                val isLandscape=if(vertical!=null) !vertical else null
+                val detailObj=video.optJSONObject("video_detail")
+                val aiUsage=video.optInt("ai_usage_type",detailObj?.optInt("ai_usage_type",0) ?: 0)
+                val isAi=if(aiUsage>0) true else null
+                val parsedTags=runCatching {
+                    val schemaStr=video.str("category_schema").ifEmpty { detailObj?.str("category_schema").orEmpty() }
+                    if(schemaStr.startsWith("[")) {
+                        val arr=JSONArray(schemaStr)
+                        (0 until minOf(arr.length(),5)).mapNotNull { arr.optJSONObject(it)?.str("name")?.takeIf(String::isNotBlank) }.joinToString(" · ")
+                    } else ""
+                }.getOrDefault("")
+                list+=Series(
+                    id,title,cleanUrl(video.str("cover").ifEmpty { video.str("cover_url") }),
+                    video.str("video_desc").ifEmpty { detailObj?.str("series_intro").orEmpty() },
+                    if(count>0) "全 $count 集" else video.str("rec_text"),
+                    video.str("sub_title").ifEmpty { parsedTags },isAi=isAi,isLandscape=isLandscape
+                ).also(SeriesMediaTrait::recordSeriesMetadata)
             }
         }
         synchronized(searchCursors) {
@@ -137,41 +315,66 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
         if(episodes.isEmpty() || episodes.any { !it.matches(Regex("[0-9]{1,30}")) } || episodes.distinct().size!=episodes.size) throw IOException("分集数据异常")
         return Detail(card(o).copy(id=id),episodes)
     }
-    private fun fetchPreloadStream(id: String, maxQuality: Int): StreamInfo? {
-        val q = LinkedHashMap(VendorConstants.preloadDevice)
-        q["_rticket"] = clock().toString()
-        val query = q.entries.joinToString("&") { "${it.key}=${java.net.URLEncoder.encode(it.value, "UTF-8")}" }
-        val url = "${VendorConstants.PRELOAD_URL}?$query"
-        val payload = """{"biz_param":{"detail_page_version":0,"device_level":3,"disable_digg_stat":false,"need_all_video_definition":true,"need_mp4_align":false,"use_os_player":false,"use_server_dns":false,"video_platform":1024},"dr_scene":"preload","mixed_video_id_map":{"1004":["$id"]}}"""
-        val request = Request.Builder()
-            .url(url)
-            .header("User-Agent", VendorConstants.PRELOAD_UA)
-            .header("Accept", "application/json; charset=utf-8,application/x-protobuf")
-            .header("Accept-Language", "zh-CN,zh;q=0.9")
-            .post(payload.toByteArray().toRequestBody("application/json; charset=utf-8".toMediaType()))
-            .build()
-        val responseText = try {
-            RequestScope.execute(http.newCall(request)) { response ->
-                if (!response.isSuccessful) return@execute null
-                val body = response.body ?: return@execute null
-                body.string()
+    private fun videoModel(id: String, allowReRegister: Boolean = true): JSONObject {
+        val hosts = listOf(
+            "https://api5-normal-lq.fqnovel.com",
+            "https://api5-normal-sinfonlinea.fqnovel.com"
+        )
+        val biz = """{"detail_page_version":0,"device_level":3,"disable_digg_stat":false,"need_all_video_definition":true,"need_mp4_align":false,"use_os_player":false,"use_server_dns":false,"video_platform":1024}"""
+        val videoMap = """{"biz_param":$biz,"mixed_video_id_map":{"1004":["$id"]}}"""
+        val candidates = listOf(
+            "/novel/player/video_model/v1/" to """{"video_id":"$id","biz_param":$biz}""",
+            "/novel/player/multi_video_model/v1/" to videoMap
+        )
+        var failure: IOException? = null
+        for (host in hosts) {
+            for ((path, body) in candidates) {
+                val attempt = runCatching {
+                    val payload = body.toByteArray()
+                    val cookie = registrationCookies.entries.joinToString("; ") { (name, value) -> "$name=$value" }.takeIf { it.isNotEmpty() }
+                    val signed = signer.sign(host + path, deviceProfile(), payload)
+                    val request = if (cookie == null) signed else signed.copy(headers = signed.headers + linkedMapOf("Cookie" to cookie))
+                    val response = text(signed.url, request)
+                    if (response.isBlank()) throw IOException("播放接口暂不可用（空响应）")
+                    val data = JSONObject(response)
+                    val code = data.optInt("Code", data.optInt("code", 0))
+                    if (code != 0) throw IOException("播放接口暂不可用（${code}）")
+                    videoModelOf(data) ?: throw IOException("播放接口暂不可用（没有播放模型）")
+                }
+                val model = attempt.getOrNull()
+                if (model != null) return model
+                val ex = attempt.exceptionOrNull()
+                System.err.println("ContentRepository.videoModel candidate $host$path failed: ${ex?.javaClass?.name}: ${ex?.message}")
+                failure = ex as? IOException ?: IOException(ex?.message ?: "播放接口暂不可用", ex)
             }
-        } catch (_: Exception) {
-            null
-        } ?: return null
-        if (responseText.isBlank()) return null
-        val data = try { JSONObject(responseText) } catch (_: Exception) { null } ?: return null
-        if (data.optInt("Code", data.optInt("code", 0)) != 0) return null
-        val map = data.optJSONObject("data") ?: return null
-        val entry = map.optJSONObject(id) ?: map.keys().asSequence().mapNotNull { map.optJSONObject(it) }.firstOrNull() ?: return null
-        val model = entry.optJSONObject("video_model") ?: runCatching { JSONObject(entry.str("video_model")) }.getOrNull() ?: return null
-        return parseModelStreams(model, maxQuality)
+        }
+        if (allowReRegister) {
+            System.err.println("ContentRepository.videoModel all candidates returned empty or failed, attempting registerDevice refresh...")
+            val refreshed = registerDevice()
+            if (refreshed != null) {
+                return videoModel(id, allowReRegister = false)
+            }
+        }
+        throw failure ?: IOException("播放接口暂不可用")
+    }
+
+    private fun videoModelOf(data: JSONObject): JSONObject? {
+        val root = data.optJSONObject("data") ?: return null
+        model(root.opt("video_model"))?.let { return it }
+        val entry = root.keys().asSequence().mapNotNull { root.optJSONObject(it) }.firstOrNull() ?: return null
+        return model(entry.opt("video_model"))
+    }
+
+    private fun model(value: Any?): JSONObject? = when (value) {
+        is JSONObject -> value
+        is String -> runCatching { JSONObject(value) }.getOrNull()
+        else -> null
     }
 
     private fun parseModelStreams(model: JSONObject, maxQuality: Int): StreamInfo? {
         val list = model.optJSONArray("video_list")
         if (list != null && list.length() > 0) {
-            data class PreloadRow(val quality: Int, val url: String, val spadeA: String)
+            data class PreloadRow(val quality: Int, val url: String, val spadeA: String, val width: Int = 0, val height: Int = 0)
             var hasIncompatible = false
             val rows = mutableListOf<PreloadRow>()
             for (i in 0 until list.length()) {
@@ -185,11 +388,12 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
                     continue
                 }
                 val height = meta?.optInt("vheight", 0) ?: 0
+                val width = meta?.optInt("vwidth", 0) ?: 0
                 val defStr = meta?.str("definition")?.ifEmpty { meta.str("quality") }.orEmpty()
                 val qNum = if (height > 0) height else qualityNumber(defStr)
                 val ei = v.optJSONObject("encrypt_info")
                 val spadeA = ei?.str("spade_a") ?: v.str("spade_a")
-                rows += PreloadRow(qNum, mainUrl, spadeA)
+                rows += PreloadRow(qNum, mainUrl, spadeA, width, height)
             }
             if (rows.isEmpty() && hasIncompatible) {
                 throw IOException("没有电视可播放的清晰度，请稍后再试或选择其他剧集")
@@ -199,7 +403,7 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
                 val selected = sorted.firstOrNull { it.quality <= maxQuality } ?: sorted.last()
                 val key = selected.spadeA.takeIf { it.isNotEmpty() }?.let(MediaCrypto::deriveKey)
                 val qualityDesc = if (selected.quality > 0) "${selected.quality}P" + (if (selected.quality > maxQuality) "（兼容资源）" else "") else "自动"
-                return StreamInfo(selected.url, key, qualityDesc)
+                return StreamInfo(selected.url, key, qualityDesc, selected.width, selected.height)
             }
         }
 
@@ -236,36 +440,19 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
 
     fun stream(id: String, maxQuality: Int = 1080): StreamInfo {
         require(id.matches(Regex("[0-9]{1,30}")))
-        try {
-            val preload = fetchPreloadStream(id, maxQuality)
-            if (preload != null) return preload
+        val model = try {
+            videoModel(id)
         } catch (e: IOException) {
+            System.err.println("ContentRepository.stream: videoModel failed for $id: ${e.message}")
             if (e.message?.contains("没有电视可播放的清晰度") == true) throw e
-        } catch (_: Exception) {}
-
-        try {
-            val payload = """{"biz_param":{"detail_page_version":0,"device_level":3,"disable_digg_stat":false,"need_all_video_definition":true,"need_mp4_align":false,"use_os_player":false,"use_server_dns":false,"video_platform":1024},"mixed_video_id_map":{"1004":["$id"]}}""".toByteArray()
-            val signed = signer.sign("https://api5-normal-sinfonlineb.fqnovel.com/novel/player/multi_video_model/v1/", VendorConstants.device, payload)
-            val dataStr = text(signed.url, signed)
-            if (dataStr.isNotBlank()) {
-                val data = JSONObject(dataStr)
-                if (data.optInt("Code", data.optInt("code", 0)) == 0) {
-                    val map = data.optJSONObject("data")
-                    val entry = map?.optJSONObject(id) ?: map?.keys()?.asSequence()?.mapNotNull { map.optJSONObject(it) }?.firstOrNull()
-                    if (entry != null) {
-                        val model = entry.optJSONObject("video_model") ?: runCatching { JSONObject(entry.str("video_model")) }.getOrNull()
-                        if (model != null) {
-                            val stream = parseModelStreams(model, maxQuality)
-                            if (stream != null) return stream
-                        }
-                    }
-                }
-            }
-        } catch (e: IOException) {
-            if (e.message?.contains("没有电视可播放的清晰度") == true) throw e
-        } catch (_: Exception) {}
-
-        return StreamInfo("$site/video/public/$id/360p.mp4", null, "360P")
+            throw e
+        } catch (e: Exception) {
+            System.err.println("ContentRepository.stream: videoModel exception for $id: ${e.message}")
+            throw IOException(e.message ?: "获取视频播放地址异常", e)
+        }
+        val stream = parseModelStreams(model, maxQuality)
+        if (stream != null) return stream
+        throw IOException("未找到可播放的视频流")
     }
     companion object {
         fun extractRouter(html: String): JSONObject {

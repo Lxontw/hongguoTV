@@ -84,9 +84,18 @@ function pythonUrlEncode(values) {
     }).join('&');
 }
 
+const WEB_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36';
+
 async function getText(url, options = {}) {
+    const isWeb = typeof url === 'string' && url.startsWith(SITE);
+    const ua = isWeb ? WEB_UA : VIDEO_UA;
     const resp = await axios(url, {
-        headers: { 'User-Agent': VIDEO_UA, 'Accept-Language': 'zh-CN,zh;q=0.9', ...options.headers },
+        headers: {
+            'User-Agent': ua,
+            'Accept-Language': 'zh-CN,zh;q=0.9',
+            ...(isWeb ? { Connection: 'close' } : {}),
+            ...options.headers
+        },
         timeout: options.timeout || 20000,
         responseType: 'text',
     });

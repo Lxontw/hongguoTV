@@ -16,7 +16,7 @@ data class AppUpdate(val versionCode: Long, val versionName: String, val minSdk:
     fun newerThan(installed: Long, sdk: Int) = versionCode > installed && minSdk <= sdk
     val downloadUrl get() = "$RELEASES/download/$tag/$fileName"
     companion object {
-        const val REPOSITORY = "N3urda/hongguoTV-updates"
+        const val REPOSITORY = "Lxontw/hongguoTV"
         const val RELEASES = "https://github.com/$REPOSITORY/releases"
         const val MAX_APK_BYTES = 80L * 1024 * 1024
         fun parse(json: String): AppUpdate {
@@ -27,8 +27,8 @@ data class AppUpdate(val versionCode: Long, val versionName: String, val minSdk:
                 o.getString("tag"), apk.getString("name"), apk.getLong("size"), apk.getString("sha256").lowercase(), o.optString("notes").take(1500))
             require(update.versionCode in 1..Int.MAX_VALUE.toLong() && update.minSdk in 26..100)
             require(update.versionName.matches(Regex("[0-9][0-9A-Za-z.+-]{0,63}")))
-            require(update.tag.matches(Regex("kotlin-v[0-9][0-9A-Za-z.+-]{0,80}")))
-            require(update.fileName.matches(Regex("hongguotv-kotlin-[0-9][0-9A-Za-z.+-]{0,80}-android8\\.apk")))
+            require(update.tag.matches(Regex("(?:kotlin-)?v[0-9][0-9A-Za-z.+-]{0,80}")))
+            require(update.fileName.matches(Regex("(?:hongguotv-kotlin-[0-9][0-9A-Za-z.+-]{0,80}-android8|HongguoTV(?:-[0-9][0-9A-Za-z.+-]{0,80})?)\\.apk")))
             require(update.size in 1..MAX_APK_BYTES && update.sha256.matches(Regex("[0-9a-f]{64}")))
             return update
         }
@@ -81,7 +81,10 @@ class AppUpdateRepository : java.io.Closeable {
         val call = http.newCall(request("${AppUpdate.RELEASES}/latest/download/update.json"))
         call.timeout().timeout(25, TimeUnit.SECONDS)
         return call.execute().use { response ->
-            if (!response.isSuccessful) throw IOException(if (response.code == 404) "尚无可用的自动更新版本" else "无法检查更新，请稍后重试")
+            if (response.code == 404) {
+                return AppUpdate(0L, "0.9.0", 26, "v0.9.0", "HongguoTV.apk", 1L, "0".repeat(64), "")
+            }
+            if (!response.isSuccessful) throw IOException("无法检查更新，请稍后重试")
             val bytes = response.body?.byteStream()?.use { input ->
                 val out = ByteArrayOutputStream(); val buffer = ByteArray(4096)
                 while (true) { val n = input.read(buffer); if (n < 0) break; if (out.size() + n > 65536) throw IOException("更新信息过大"); out.write(buffer, 0, n) }

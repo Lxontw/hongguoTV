@@ -9,12 +9,15 @@ import android.view.Gravity
 import android.view.View
 import android.view.Window
 import android.widget.*
+import com.hongguotv.core.Series
+import com.hongguotv.core.SeriesSeasons
 
 /** A remote-accessible side panel; selecting a number is the only action that changes episodes. */
 class EpisodePanel(
     private val activity: Activity,private val count: Int,private val current: Int,
+    private val seasons: List<Series> = emptyList(),private val currentSeriesId: String = "",private val baseTitle: String = "",
     private val locate: (Int,View,(Int)->Unit)->Unit,
-    private val select: (Int)->Unit,private val closed: ()->Unit
+    private val select: (Int)->Unit,private val selectSeason: (Series)->Unit = {},private val closed: ()->Unit
 ) {
     private val dialog=Dialog(activity)
     private var group=current/20
@@ -47,6 +50,24 @@ class EpisodePanel(
         jump=button("跳转集数") { locate(focused,jump) { target -> focused=target; group=target/20; render() } }
         listOf(close,jump).forEach { actions.addView(it,LinearLayout.LayoutParams(0,-2,1f).apply { setMargins(dp(3),dp(3),dp(3),dp(3)) }) }
         content.addView(actions)
+        val seasonCells=mutableListOf<TextView>()
+        if(seasons.size>1) {
+            content.addView(label("同系列选季（共 ${seasons.size} 季）：",13f).apply { setTextColor(TvStyle.muted) })
+            seasons.chunked(4).forEach { chunk ->
+                val sRow=LinearLayout(activity)
+                chunk.forEach { s ->
+                    val isCurr=s.id==currentSeriesId
+                    val sLabel=SeriesSeasons.label(s.title,baseTitle)+(if(isCurr) "·当前" else "")
+                    val sBtn=button(sLabel,isCurr) { if(!isCurr) selectSeason(s) }.apply {
+                        textSize=13f; minHeight=dp(38); setPadding(dp(4),dp(4),dp(4),dp(4))
+                    }
+                    sRow.addView(sBtn,LinearLayout.LayoutParams(0,-2,1f).apply { setMargins(dp(3),dp(2),dp(3),dp(2)) })
+                    seasonCells+=sBtn
+                }
+                repeat(4-chunk.size) { sRow.addView(Space(activity),LinearLayout.LayoutParams(0,1,1f)) }
+                content.addView(sRow)
+            }
+        }
         val paging=LinearLayout(activity)
         val previous=button("‹ 上一组") { group--; focused=group*20; render() }.apply { isEnabled=group>0; isFocusable=isEnabled; alpha=if(isEnabled) 1f else .4f }
         val next=button("下一组 ›") { group++; focused=group*20; render() }.apply { isEnabled=(group+1)*20<count; isFocusable=isEnabled; alpha=if(isEnabled) 1f else .4f }
@@ -66,16 +87,26 @@ class EpisodePanel(
             repeat(5-indexes.size) { row.addView(Space(activity),LinearLayout.LayoutParams(0,1,1f)) }
             grid.addView(row)
         }
+        val downFromPagingLeft=cells.first().id
+        val downFromPagingRight=cells[minOf(4,cells.lastIndex)].id
+        val upFromPagingLeft=seasonCells.firstOrNull()?.id ?: close.id
+        val upFromPagingRight=seasonCells.firstOrNull()?.id ?: jump.id
+        seasonCells.forEachIndexed { i,sBtn ->
+            sBtn.nextFocusLeftId=seasonCells[if(i%4==0) i else i-1].id
+            sBtn.nextFocusRightId=seasonCells[if(i%4==3 || i==seasonCells.lastIndex) i else i+1].id
+            sBtn.nextFocusUpId=if(i>=4) seasonCells[i-4].id else if(i%4<2) close.id else jump.id
+            sBtn.nextFocusDownId=if(i+4<seasonCells.size) seasonCells[i+4].id else if(previous.isFocusable) previous.id else if(next.isFocusable) next.id else downFromPagingLeft
+        }
         cells.forEachIndexed { i,cell ->
             cell.nextFocusLeftId=cells[if(i%5==0) i else i-1].id
             cell.nextFocusRightId=cells[if(i%5==4 || i==cells.lastIndex) i else i+1].id
-            cell.nextFocusUpId=if(i>=5) cells[i-5].id else if(i<3 && previous.isFocusable) previous.id else if(next.isFocusable) next.id else jump.id
+            cell.nextFocusUpId=if(i>=5) cells[i-5].id else if(i<3 && previous.isFocusable) previous.id else if(next.isFocusable) next.id else seasonCells.firstOrNull()?.id ?: jump.id
             cell.nextFocusDownId=cells[if(i+5<cells.size) i+5 else if(i/5<cells.lastIndex/5) cells.lastIndex else i].id
         }
-        previous.nextFocusUpId=close.id; next.nextFocusUpId=jump.id
-        previous.nextFocusDownId=cells.first().id; next.nextFocusDownId=cells[minOf(4,cells.lastIndex)].id
-        close.nextFocusDownId=if(previous.isFocusable) previous.id else cells.first().id
-        jump.nextFocusDownId=if(next.isFocusable) next.id else cells[minOf(4,cells.lastIndex)].id
+        previous.nextFocusUpId=upFromPagingLeft; next.nextFocusUpId=upFromPagingRight
+        previous.nextFocusDownId=downFromPagingLeft; next.nextFocusDownId=downFromPagingRight
+        close.nextFocusDownId=seasonCells.firstOrNull()?.id ?: if(previous.isFocusable) previous.id else downFromPagingLeft
+        jump.nextFocusDownId=seasonCells.getOrNull(minOf(2,seasonCells.lastIndex))?.id ?: if(next.isFocusable) next.id else downFromPagingRight
         close.nextFocusLeftId=close.id; close.nextFocusRightId=jump.id; jump.nextFocusLeftId=close.id; jump.nextFocusRightId=jump.id
         dialog.setContentView(content)
         cells[(focused-group*20).coerceIn(0,cells.lastIndex)].requestFocus()

@@ -9,6 +9,9 @@ import android.view.KeyEvent
 import android.view.View
 import android.widget.*
 import com.hongguotv.core.Series
+import com.hongguotv.core.SeriesMediaTrait
+import com.hongguotv.core.DramaNature
+import com.hongguotv.core.ScreenOrientation
 
 /** Fixed text slots keep D-pad movement from resizing the content below the preview. */
 class SeriesPreview(context: Context): LinearLayout(context) {
@@ -44,7 +47,7 @@ class HomeScreen(
     data class Entry(val series: Series,val label: String,val resume: Boolean=false,val progress: Int?=null)
     data class Shelf(val key: String,val title: String,val entries: List<Entry>,val more: (() -> Unit)?=null)
     data class Position(val focus: String,val shelf: String?,val column: Int,val row: Int,val vertical: Int,val horizontal: Map<String,Int>)
-    private data class Card(val key: String,val view: LinearLayout,val image: ImageView?,val title: TextView,val label: TextView,val progress: ProgressBar?,var entry: Entry?,var pending: Boolean=false)
+    private data class Card(val key: String,val view: LinearLayout,val image: ImageView?,val title: TextView,val label: TextView,val progress: ProgressBar?,var entry: Entry?,var pending: Boolean=false,val natureBadge: TextView?=null,val orientationBadge: TextView?=null)
     private data class Row(val key: String,val block: LinearLayout,val horizontal: HorizontalScrollView,val cards: List<Card>)
     private val accent=TvStyle.accent
     private fun dp(n: Int)=(n*resources.displayMetrics.density).toInt()
@@ -82,6 +85,14 @@ class HomeScreen(
         val card=cards["$shelfKey:${entry.series.id}"] ?: return false
         if(card.entry?.series?.cover!=entry.series.cover) { card.image?.setImageDrawable(null) }
         card.entry=entry; card.title.text=entry.series.title; card.label.text=entry.label
+        val nature=SeriesMediaTrait.detectNature(entry.series)
+        card.natureBadge?.text=nature.label
+        card.natureBadge?.background=TvStyle.badge(context,nature.badgeColor,radius=4)
+        val orient=SeriesMediaTrait.detectOrientation(entry.series)
+        card.orientationBadge?.apply {
+            text=orient.ratioText
+            setCompoundDrawables(TvStyle.screenFrame(context,orient.isLandscape),null,null,null)
+        }
         card.progress?.apply { progress=entry.progress ?: 0; visibility=if(entry.progress==null) INVISIBLE else VISIBLE }
         card.view.contentDescription="${shelves.firstOrNull { it.key==shelfKey }?.title.orEmpty()}，${entry.series.title}，${entry.label}"
         shelves=shelves.map { shelf -> if(shelf.key==shelfKey) shelf.copy(entries=shelf.entries.map { if(it.series.id==entry.series.id) entry else it }) else shelf }
@@ -117,12 +128,35 @@ class HomeScreen(
                 val key=if(entry!=null) "${shelf.key}:${entry.series.id}" else "${shelf.key}:more"
                 val view=LinearLayout(context).apply { orientation=VERTICAL; id=View.generateViewId(); tag=key; isFocusable=true; isFocusableInTouchMode=true; setPadding(dp(4),dp(4),dp(4),dp(8)); background=shape(false) }
                 val image=if(entry!=null) ImageView(context).apply { scaleType=ImageView.ScaleType.FIT_CENTER; importantForAccessibility=IMPORTANT_FOR_ACCESSIBILITY_NO } else null
-                view.addView(image ?: label("›",36f).apply { gravity=Gravity.CENTER },LayoutParams(-1,((width-dp(8))/TvStyle.POSTER_ASPECT).toInt()))
+                var natureBadge: TextView? = null
+                var orientationBadge: TextView? = null
+                if(entry!=null && image!=null) {
+                    val artwork=FrameLayout(context)
+                    artwork.addView(image,FrameLayout.LayoutParams(-1,-1))
+                    val nature=SeriesMediaTrait.detectNature(entry.series)
+                    natureBadge=TextView(context).apply {
+                        text=nature.label; textSize=10f; setTypeface(null,Typeface.BOLD); setTextColor(android.graphics.Color.WHITE)
+                        setPadding(dp(5),dp(2),dp(5),dp(2)); background=TvStyle.badge(context,nature.badgeColor,radius=4)
+                    }
+                    artwork.addView(natureBadge,FrameLayout.LayoutParams(-2,-2,Gravity.TOP or Gravity.START).apply { topMargin=dp(4); leftMargin=dp(4) })
+                    val orient=SeriesMediaTrait.detectOrientation(entry.series)
+                    orientationBadge=TextView(context).apply {
+                        text=orient.ratioText; textSize=9.5f; setTypeface(null,Typeface.BOLD); setTextColor(android.graphics.Color.rgb(241,245,249))
+                        gravity=Gravity.CENTER_VERTICAL
+                        compoundDrawablePadding=dp(4)
+                        setCompoundDrawables(TvStyle.screenFrame(context,orient.isLandscape),null,null,null)
+                        setPadding(dp(6),dp(2),dp(6),dp(2)); background=TvStyle.badge(context,TvStyle.orientationBadgeBg,radius=4,border=TvStyle.orientationBadgeBorder,strokeDp=0.8f)
+                    }
+                    artwork.addView(orientationBadge,FrameLayout.LayoutParams(-2,-2,Gravity.BOTTOM or Gravity.END).apply { bottomMargin=dp(5); rightMargin=dp(5) })
+                    view.addView(artwork,LayoutParams(-1,((width-dp(8))/TvStyle.POSTER_ASPECT).toInt()))
+                } else {
+                    view.addView(label("›",36f).apply { gravity=Gravity.CENTER },LayoutParams(-1,((width-dp(8))/TvStyle.POSTER_ASPECT).toInt()))
+                }
                 val title=label(entry?.series?.title ?: "查看全部",14f).apply { minLines=2; maxLines=2; ellipsize=TextUtils.TruncateAt.END; setPadding(dp(3),dp(5),dp(3),0) }
                 val badge=label(entry?.label ?: shelf.title,12f,TvStyle.muted).apply { minLines=1; maxLines=1; ellipsize=TextUtils.TruncateAt.END; setPadding(dp(3),dp(2),0,0) }
                 val progress=ProgressBar(context,null,android.R.attr.progressBarStyleHorizontal).apply { max=100; progress=entry?.progress ?: 0; visibility=if(entry?.progress==null) INVISIBLE else VISIBLE; progressTintList=android.content.res.ColorStateList.valueOf(accent) }
                 view.addView(title); view.addView(badge); view.addView(progress,LayoutParams(-1,dp(3)).apply { topMargin=dp(4) })
-                val card=Card(key,view,image,title,badge,progress,entry)
+                val card=Card(key,view,image,title,badge,progress,entry,natureBadge=natureBadge,orientationBadge=orientationBadge)
                 view.contentDescription=entry?.let { "${shelf.title}，${it.series.title}，${it.label}" } ?: "查看全部${shelf.title}"
                 view.setOnClickListener { lastFocus=key; remember(key); card.entry?.let { open(it.series,it.resume) } ?: moreAction?.invoke() }
                 if(entry!=null) {

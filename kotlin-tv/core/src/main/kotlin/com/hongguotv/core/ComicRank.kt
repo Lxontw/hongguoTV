@@ -37,7 +37,8 @@ internal object ComicRank {
                     if(id !in positions) positions[id]=RankPosition(row.optInt("rank").takeIf { it>0 },row.str("heatText"))
                     Series(id,row.str("title"),cleanUrl(row.str("cover")),
                         row.str("description"),if(count>0) "全 $count 集" else row.str("heatText"),
-                        (0 until minOf(tags.length(),5)).joinToString(" · ") { tags.optString(it) })
+                        (0 until minOf(tags.length(),5)).joinToString(" · ") { tags.optString(it) },
+                        isAi=true,isLandscape=true).also(SeriesMediaTrait::recordSeriesMetadata)
                 }.filter { it.id.matches(Regex("[0-9]{1,30}")) && it.title.isNotBlank() }.distinctBy { it.id }
                 return CatalogPage(items,items.isNotEmpty() && page<minOf(totalPages,100),
                     ComicRanking(positions.filterKeys { id -> items.any { it.id==id } },minOf(totalPages,100),updatedText))
@@ -48,9 +49,9 @@ internal object ComicRank {
 
     private fun renderedPage(document: Document, html: String, page: Int): CatalogPage {
         // Some responses contain rendered cards while the deferred JSON is still unresolved.
-        val route=ContentRepository.extractRouter(html).optJSONObject("loaderData")
-            ?.optJSONObject("rank_hot-comic-drama/page") ?: throw IOException("页面没有漫剧榜单数据")
-        if(route.str("rankKey")!="comic" || route.optInt("pageNum")!=page) throw IOException("漫剧分页信息异常")
+        val route=runCatching { ContentRepository.extractRouter(html).optJSONObject("loaderData")
+            ?.optJSONObject("rank_hot-comic-drama/page") }.getOrNull()
+        if(route != null && (route.str("rankKey")!="comic" || route.optInt("pageNum")!=page)) throw IOException("漫剧分页信息异常")
         val positions=linkedMapOf<String,RankPosition>()
         val items=document.select("article[aria-labelledby^=rank-title-]").mapNotNull { article ->
             val heading=article.attr("aria-labelledby")
@@ -63,12 +64,13 @@ internal object ComicRank {
             Series(id,title,article.selectFirst("img[src]")?.attr("src").orEmpty(),
                 article.selectFirst("p[class*=description-]")?.text().orEmpty(),
                 article.selectFirst("p[class*=metrics-]")?.text().orEmpty(),
-                article.select("p[class*=categories-] > span").take(5).joinToString(" · ") { it.text() })
+                article.select("p[class*=categories-] > span").take(5).joinToString(" · ") { it.text() },
+                isAi=true,isLandscape=true).also(SeriesMediaTrait::recordSeriesMetadata)
         }.distinctBy { it.id }
         if(items.isEmpty()) throw IOException("页面没有漫剧榜单数据")
         val paging=document.selectFirst("nav[aria-label=榜单分页]") ?: throw IOException("漫剧分页信息缺失")
         if(paging.selectFirst("[aria-current=page]")?.text()?.toIntOrNull()!=page) throw IOException("漫剧分页信息异常")
         val lastPage=maxOf(page,paging.select("a[href]").mapNotNull { it.attr("href").substringAfter("?page=","").substringBefore('&').toIntOrNull() }.maxOrNull() ?: page)
-        return CatalogPage(items,page<minOf(lastPage,100),ComicRanking(positions,minOf(lastPage,100),route.str("updatedText")))
+        return CatalogPage(items,page<minOf(lastPage,100),ComicRanking(positions,minOf(lastPage,100),route?.str("updatedText").orEmpty()))
     }
 }

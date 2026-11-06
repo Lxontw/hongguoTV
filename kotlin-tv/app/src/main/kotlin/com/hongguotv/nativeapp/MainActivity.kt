@@ -41,6 +41,35 @@ class MainActivity: Activity() {
     private var queuedVideo: RemoteVideo?=null
     private var queuedEpisodeId=""
     private val preparedNext=PreparedSlot<RemoteVideo>({ android.os.SystemClock.elapsedRealtime() })
+    private val deviceRegisterLock = Any()
+    @Volatile private var deviceRegistering = false
+
+    private fun ensureDeviceRegistered() {
+        if(library.deviceRegistered() || deviceRegistering) return
+        deviceRegistering = true
+        io.submit {
+            val registered = registerDeviceOnce()
+            main.post {
+                deviceRegistering = false
+                if(registered && foreground && screen == "catalog" && tab == 0) showCatalog(load = true)
+            }
+        }
+    }
+
+    private fun registerDeviceOnce(force: Boolean = false): Boolean {
+        synchronized(deviceRegisterLock) {
+            if(!force && library.deviceRegistered()) {
+                if (repository.deviceIdentity.isEmpty()) {
+                    repository.deviceIdentity = library.deviceIdentity()
+                }
+                return true
+            }
+            val registered = runCatching { repository.registerDevice() }.getOrNull() ?: return false
+            library.saveDeviceIdentity(registered.deviceId, registered.installId)
+            repository.deviceIdentity = library.deviceIdentity()
+            return true
+        }
+    }
     private var prefetchJob: java.util.concurrent.Future<*>?=null
     private var prefetchScope: RequestScope?=null
     private var prefetchedFor=""
@@ -58,6 +87,7 @@ class MainActivity: Activity() {
     private var playerListener: Player.Listener?=null
     private lateinit var playbackTitle: TextView
     private var directPlayback=false
+    private var detailSeasons: List<Series> = emptyList()
     private var collection: String?=null
     private var collectionReturn: CatalogState?=null
     private var collectionFocus=""
@@ -133,6 +163,7 @@ class MainActivity: Activity() {
     private var ranking: ComicRanking?=null
     private var rankRefresh: View?=null
     private var rankSubtitle: TextView?=null
+    private var settingsUpdateButton: TextView?=null
     private val tabState=mutableMapOf<Int,CatalogState>()
     private val tabFocus=mutableMapOf<Int,String>()
     private val nav=mutableListOf<View>()
@@ -198,7 +229,7 @@ class MainActivity: Activity() {
         super.onCreate(state)
         window.decorView.systemUiVisibility=View.SYSTEM_UI_FLAG_FULLSCREEN or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
         library=Library(this); artwork=ArtworkLoader(this); tvTools=TvTools(this); root=FrameLayout(this).apply { setBackgroundColor(bg) }; setContentView(root)
-        updater=AppUpdater(this) { foreground && library.isLoaded && screen=="catalog" && !tvTools.showing }
+        updater=AppUpdater(this, { foreground && library.isLoaded && screen=="catalog" && !tvTools.showing }, { refreshUpdateLabels() })
         connectivity=getSystemService(ConnectivityManager::class.java)
         runCatching { connectivity.registerDefaultNetworkCallback(networkCallback); networkRegistered=true }
         favoriteMonitor=FavoriteMonitor(library,repository) { refreshFavoriteLabels() }
@@ -227,6 +258,11 @@ class MainActivity: Activity() {
         library.loadAsync(onFailure={ problem ->
             if(!isDestroyed) { libraryLoadError=problem; if(foreground) showLibraryError(problem) }
         }) {
+            repository.deviceIdentity=library.deviceIdentity()
+            repository.onDeviceRegistered = { registered ->
+                library.saveDeviceIdentity(registered.deviceId, registered.installId)
+            }
+            ensureDeviceRegistered()
             if(!isDestroyed && foreground) {
                 showCatalog(load=true)
                 favoriteMonitor.check()
@@ -266,7 +302,7 @@ class MainActivity: Activity() {
         homeScreen=null; selectionPreview=null; catalogScroll=null
         nav.clear(); typeButtons.clear(); searchInput=null; searchButton=null; searchActions.clear()
         historyManage=null; rankRefresh=null; rankSubtitle=null; collectionBack=null; favoriteBadges.clear()
-        favoriteStatus=null; favoriteCheck=null; homeUpdates=null; resumeCards.clear()
+        favoriteStatus=null; favoriteCheck=null; homeUpdates=null; settingsUpdateButton=null; resumeCards.clear()
         catalogCards.clear(); cardImages.clear()
     }
     private fun <T> work(action: ()->T,done: (T)->Unit,failed: (Throwable)->Unit) {
@@ -342,11 +378,12 @@ class MainActivity: Activity() {
         if(foreground && library.isLoaded && !favoriteMonitor.running) main.post { if(foreground && screen=="catalog") favoriteMonitor.check() }
         val top=row().apply { setPadding(0,0,0,dp(8)) }
         val brand=row()
-        brand.addView(ImageView(this).apply { setImageResource(com.hongguotv.nativeapp.R.drawable.app_icon) },lp(dp(28),dp(28)).apply { rightMargin=dp(9) })
-        brand.addView(text("红果",22f).apply { typeface=Typeface.create("sans-serif-medium",Typeface.NORMAL) })
-        top.addView(brand,lp(dp(120),dp(44)))
+        brand.addView(ImageView(this).apply { setImageResource(com.hongguotv.nativeapp.R.drawable.app_icon) },lp(dp(34),dp(34)).apply { rightMargin=dp(9) })
+        brand.addView(text("宏果tv",22f).apply { typeface=Typeface.create("sans-serif-medium",Typeface.NORMAL) })
+        top.addView(brand,lp(dp(136),dp(44)))
         listOf("首页","搜索","排行榜","收藏","最近观看","设置").forEachIndexed { index,label ->
-            val item=addButton(top,label,index==tab) { switchTab(index) }
+            val displayLabel=if(index==5 && updater.hasUpdate) "设置 · 有新版" else label
+            val item=addButton(top,displayLabel,index==tab) { switchTab(index) }
             fun paint(focused: Boolean) {
                 item.setTextColor(if(focused) bg else if(index==tab) accent else muted)
                 item.background=rounded(if(focused) white else if(index==tab) Color.rgb(48,32,29) else Color.TRANSPARENT)
@@ -378,17 +415,64 @@ class MainActivity: Activity() {
             nav.forEach { it.nextFocusDownId=typeButtons.getValue(library.contentType).id }
         }
         if(tab==1) {
-            val searchRow=row(); val input=EditText(this).apply { id=View.generateViewId(); hint="输入${library.contentType.label}名称或关键词"; setText(query); textSize=16f; setTextColor(white); setHintTextColor(muted); isSingleLine=true; maxLines=1; filters=arrayOf(android.text.InputFilter.LengthFilter(80)); imeOptions=android.view.inputmethod.EditorInfo.IME_ACTION_SEARCH }
+            val searchRow=row()
+            val input=EditText(this).apply {
+                id=View.generateViewId()
+                hint="输入${library.contentType.label}名称或关键词（支持繁简体）"
+                setText(query)
+                textSize=16f
+                setTextColor(white)
+                setHintTextColor(muted)
+                isSingleLine=true
+                maxLines=1
+                filters=arrayOf(android.text.InputFilter.LengthFilter(80))
+                imeOptions=android.view.inputmethod.EditorInfo.IME_ACTION_SEARCH
+            }
             searchRow.addView(input,lp(0,dp(45)).apply { weight=1f; rightMargin=dp(10) })
             fun search() { val next=input.text.toString().trim(); if(next.isBlank()) { input.requestFocus(); return }; runSearch(next) }
-            searchInput=input; searchButton=addButton(searchRow,"搜索") { search() }; input.nextFocusUpId=typeButtons.getValue(library.contentType).id; searchButton?.nextFocusUpId=input.nextFocusUpId
+            searchInput=input
+            searchButton=addButton(searchRow,"搜索") { search() }
+            input.nextFocusUpId=typeButtons.getValue(library.contentType).id
+            searchButton?.nextFocusUpId=input.nextFocusUpId
+            if(query.isNotBlank()) {
+                val clearBtn=addButton(searchRow,"清空") { query=""; input.setText(""); showCatalog() }
+                clearBtn.nextFocusUpId=input.nextFocusUpId
+                searchActions.add(clearBtn)
+            }
             lateinit var recent: TextView
-            recent=addButton(searchRow,"历史") { showSearchHistory(recent) }; recent.nextFocusUpId=input.nextFocusUpId
+            recent=addButton(searchRow,"历史") { showSearchHistory(recent) }
+            recent.nextFocusUpId=input.nextFocusUpId
             lateinit var phone: TextView
-            phone=addButton(searchRow,"手机输入") { (getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager).hideSoftInputFromWindow(input.windowToken,0); tvTools.phoneInput(phone) { runSearch(it) } }; phone.nextFocusUpId=input.nextFocusUpId
+            phone=addButton(searchRow,"手机输入") { (getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager).hideSoftInputFromWindow(input.windowToken,0); tvTools.phoneInput(phone) { runSearch(it) } }
+            phone.nextFocusUpId=input.nextFocusUpId
             searchActions.addAll(listOf(recent,phone))
             typeButtons.values.forEach { it.nextFocusDownId=input.id }
-            input.setOnEditorActionListener { _,_,_-> search(); true }; container.addView(searchRow)
+            input.setOnEditorActionListener { _,_,_-> search(); true }
+            container.addView(searchRow)
+
+            val hotRow=HorizontalScrollView(this).apply {
+                isVerticalScrollBarEnabled=false
+                isHorizontalScrollBarEnabled=false
+                setPadding(0,dp(6),0,dp(4))
+            }
+            val hotChips=row()
+            hotChips.addView(text("热门推荐：",13f,muted).apply { setPadding(0,dp(6),dp(6),dp(6)) })
+            var firstChip: View?=null
+            repository.hotSearches().forEach { keyword ->
+                val chip=addButton(hotChips,keyword) { runSearch(keyword) }.apply {
+                    textSize=13f
+                    minHeight=dp(30)
+                    setPadding(dp(10),dp(4),dp(10),dp(4))
+                    nextFocusUpId=input.id
+                }
+                if(firstChip==null) firstChip=chip
+            }
+            if(firstChip!=null) {
+                input.nextFocusDownId=firstChip!!.id
+                searchButton?.nextFocusDownId=firstChip!!.id
+            }
+            hotRow.addView(hotChips)
+            container.addView(hotRow)
         } else if(tab==2) {
             val heading=row().apply { setPadding(0,dp(8),0,dp(6)) }
             heading.addView(text("漫剧热播榜",25f).apply { setTypeface(null,Typeface.BOLD) },lp(0,-2).apply { weight=1f })
@@ -426,6 +510,7 @@ class MainActivity: Activity() {
             else { message(body,"正在加载…"); if(focusType) typeButtons[library.contentType]?.requestFocus() else nav[tab].requestFocus() }
             val requestTab=tab; val requestPage=page; val requestQuery=query; val requestType=library.contentType
             work({
+                if(!library.deviceRegistered()) registerDeviceOnce()
                 val result=when(requestTab) { 0 -> repository.home(requestPage,requestType); 2 -> repository.comicRanking(requestPage); else -> repository.search(requestQuery,requestPage,requestType) }
                 result
             }, { result ->
@@ -496,11 +581,28 @@ class MainActivity: Activity() {
                 val position=if(tab==2) ranking?.positions?.get(item.id) else null
                 val artwork=FrameLayout(this); card.addView(artwork,lp(-1,((width-dp(8))/TvStyle.POSTER_ASPECT).toInt()))
                 val image=ImageView(this).apply { scaleType=ImageView.ScaleType.FIT_CENTER; importantForAccessibility=View.IMPORTANT_FOR_ACCESSIBILITY_NO }; artwork.addView(image,FrameLayout.LayoutParams(-1,-1)); loadCover(image,item.cover); cardImages[item.id]=image to item.cover
+                val nature=SeriesMediaTrait.detectNature(item)
+                val orient=SeriesMediaTrait.detectOrientation(item)
                 if(tab==2) {
                     val rankLabel=position?.rank?.let { "第 $it 名" } ?: "名次暂无"
                     artwork.addView(text(rankLabel,15f).apply { setTypeface(null,Typeface.BOLD); setPadding(dp(8),dp(5),dp(8),dp(5)); background=rounded(if((position?.rank ?: Int.MAX_VALUE)<=3) accent else Color.rgb(28,31,39)) },FrameLayout.LayoutParams(-2,-2,Gravity.TOP or Gravity.START))
                     card.contentDescription="$rankLabel，${item.title}，${position?.heat?.ifBlank { "热度暂无" } ?: "热度暂无"}"
+                    artwork.addView(text(nature.label,10f).apply {
+                        setTypeface(null,Typeface.BOLD); setTextColor(Color.WHITE)
+                        setPadding(dp(5),dp(2),dp(5),dp(2)); background=TvStyle.badge(this@MainActivity,nature.badgeColor,radius=4)
+                    },FrameLayout.LayoutParams(-2,-2,Gravity.TOP or Gravity.END).apply { topMargin=dp(4); rightMargin=dp(4) })
+                } else {
+                    artwork.addView(text(nature.label,10f).apply {
+                        setTypeface(null,Typeface.BOLD); setTextColor(Color.WHITE)
+                        setPadding(dp(5),dp(2),dp(5),dp(2)); background=TvStyle.badge(this@MainActivity,nature.badgeColor,radius=4)
+                    },FrameLayout.LayoutParams(-2,-2,Gravity.TOP or Gravity.START).apply { topMargin=dp(4); leftMargin=dp(4) })
                 }
+                artwork.addView(text(orient.ratioText,9.5f,Color.rgb(241,245,249)).apply {
+                    setTypeface(null,Typeface.BOLD); gravity=Gravity.CENTER_VERTICAL
+                    compoundDrawablePadding=dp(4)
+                    setCompoundDrawables(TvStyle.screenFrame(this@MainActivity,orient.isLandscape),null,null,null)
+                    setPadding(dp(6),dp(2),dp(6),dp(2)); background=TvStyle.badge(this@MainActivity,TvStyle.orientationBadgeBg,radius=4,border=TvStyle.orientationBadgeBorder,strokeDp=0.8f)
+                },FrameLayout.LayoutParams(-2,-2,Gravity.BOTTOM or Gravity.END).apply { bottomMargin=dp(5); rightMargin=dp(5) })
                 card.addView(text(item.title,14f).apply { maxLines=2; minLines=2; ellipsize=TextUtils.TruncateAt.END; setPadding(dp(3),dp(7),dp(3),0) },lp(-1,-2).apply { weight=1f })
                 val progress=if(tab==4 || collection=="resume") library.progress(item.id) else null
                 val badge=text(if(tab==3) library.favoriteLabel(item.id) else if(tab==2) position?.heat?.ifBlank { "热度暂无" } ?: "热度暂无" else if(progress!=null) if(library.watched(item.id)) "整剧已看完" else "第 ${progress.episodeIndex+1} 集 · ${formatTime(progress.position)}" else item.badge,12f,if(tab==2 || tab==3) accent else muted).apply { maxLines=1; minLines=1; minHeight=dp(19); ellipsize=TextUtils.TruncateAt.END; setPadding(dp(3),0,0,0) }
@@ -651,6 +753,11 @@ class MainActivity: Activity() {
             }
         })
     }
+    private fun settingsUpdateLabel() = if (updater.hasUpdate) "检查更新  ·  发现新版 ${updater.availableVersionName ?: ""}（当前 v${BuildConfig.VERSION_NAME}）" else "检查更新  ·  当前版本 v${BuildConfig.VERSION_NAME}"
+    private fun refreshUpdateLabels() {
+        (nav.getOrNull(5) as? TextView)?.text = if (updater.hasUpdate) "设置 · 有新版" else "设置"
+        settingsUpdateButton?.text = settingsUpdateLabel()
+    }
     private fun refreshFavoriteLabels() {
         if(screen!="catalog" || !library.isLoaded) return
         favoriteBadges.forEach { (id,label) -> val value=library.favoriteLabel(id); if(label.text.toString()!=value) label.text=value }
@@ -709,6 +816,9 @@ class MainActivity: Activity() {
             library.seamlessNext=!library.seamlessNext
             seamlessNextButton.text="无缝换集  ·  ${if(library.seamlessNext) "开启" else "关闭"}"
         }
+        lateinit var updates: TextView
+        updates=setting(device,settingsUpdateLabel()) { updater.show(updates) }
+        settingsUpdateButton=updates
         lateinit var backup: TextView
         backup=setting(device,"手机备份与恢复") {
             runCatching { LibraryBackup.encode(library.snapshot()) }.onSuccess { encoded ->
@@ -724,20 +834,18 @@ class MainActivity: Activity() {
         hidden=setting(device,"恢复隐藏推荐  ·  ${library.hidden().size} 部") {
             library.unhideAll(); hidden.text="恢复隐藏推荐  ·  0 部"; Toast.makeText(this,"热门推荐已恢复",Toast.LENGTH_SHORT).show()
         }
-        lateinit var updates: TextView
-        updates=setting(device,"版本与更新  ·  ${BuildConfig.VERSION_NAME}") { updater.show(updates) }
         val license=setting(device,"开源许可") {
-            AlertDialog.Builder(this).setTitle("开源许可").setMessage("本原生版以 GPL-3.0 发布。\n内容协议与加密处理移植自 drpys（22261ad）。\nAndroidX Media3 / OkHttp：Apache-2.0\nKotlin：Apache-2.0\nBouncy Castle：MIT\n完整源码和许可证见 GitHub：N3urda/hongguoTV-updates。").setPositiveButton("关闭",null).show()
+            AlertDialog.Builder(this).setTitle("开源许可").setMessage("本原生版以 GPL-3.0 发布。\n内容协议与加密处理移植自 drpys（22261ad）。\nAndroidX Media3 / OkHttp：Apache-2.0\nKotlin：Apache-2.0\nBouncy Castle：MIT\n完整源码和许可证见 GitHub：Lxontw/hongguoTV。").setPositiveButton("关闭",null).show()
         }
-        val left=listOf(qualityButton,defaultSpeed,frame,autoNextButton,seamlessNextButton); val right=listOf(backup,hidden,updates,license)
+        val left=listOf(qualityButton,defaultSpeed,frame,autoNextButton,seamlessNextButton); val right=listOf(updates,backup,hidden,license)
         listOf(left,right).forEach { items -> items.forEachIndexed { index,view ->
             view.nextFocusUpId=items.getOrNull(index-1)?.id ?: nav[tab].id
             view.nextFocusDownId=items.getOrNull(index+1)?.id ?: view.id
         } }
         left.forEachIndexed { i,v -> v.nextFocusLeftId=v.id; v.nextFocusRightId=right.getOrNull(i)?.id ?: right.last().id }
         right.forEachIndexed { i,v -> v.nextFocusLeftId=left.getOrNull(i)?.id ?: left.last().id; v.nextFocusRightId=v.id }
-        nav.forEach { it.nextFocusDownId=qualityButton.id }
-        parent.addView(text("红果 TV  /  ${BuildConfig.VERSION_NAME}    ·    收藏与进度保存在本机",12f,muted).apply { setPadding(dp(2),dp(18),0,dp(10)) })
+        nav.forEachIndexed { idx,v -> v.nextFocusDownId=if(idx==5) updates.id else qualityButton.id }
+        parent.addView(text("宏果tv  /  ${BuildConfig.VERSION_NAME}    ·    收藏与进度保存在本机",12f,muted).apply { setPadding(dp(2),dp(18),0,dp(10)) })
         nav[tab].requestFocus()
     }
     private fun runSearch(value: String,type: ContentType=library.contentType) {
@@ -764,10 +872,25 @@ class MainActivity: Activity() {
     }
     private fun openDetail(series: Series,resume: Boolean=false,autoplay: Boolean=true) {
         pendingDetail=series; detailAutoplay=autoplay
-        invalidatePage(); releaseCatalogViews(); screen="detail"; directPlayback=resume; detail=null; synopsisExpanded=false
+        invalidatePage(); releaseCatalogViews(); screen="detail"; directPlayback=resume; detail=null; synopsisExpanded=false; detailSeasons=emptyList()
         val body=base(series.title); message(body,"正在加载剧集…")
-        work({ repository.detail(series.id) }, { result ->
-            detail=result; library.observeFavorite(series.id,result.episodes.size,System.currentTimeMillis(),acknowledge=true)
+        work({
+            if(!library.deviceRegistered()) registerDeviceOnce()
+            val result = repository.detail(series.id)
+            val seasons = runCatching { repository.searchSiblings(result.series) }.getOrDefault(emptyList())
+            val firstEp = result.episodes.firstOrNull()
+            if (firstEp != null && series.isLandscape == null) {
+                runCatching { repository.stream(firstEp, library.maxQuality) }.getOrNull()?.let { st ->
+                    if (st.width > 0 && st.height > 0) {
+                        SeriesMediaTrait.recordVideoDimension(series.id, st.width, st.height)
+                    }
+                }
+            }
+            result to seasons
+        }, { (result, seasons) ->
+            detail=result; detailSeasons=seasons; library.observeFavorite(series.id,result.episodes.size,System.currentTimeMillis(),acknowledge=true)
+            SeriesMediaTrait.recordSeriesMetadata(series)
+            SeriesMediaTrait.recordNature(series.id, SeriesMediaTrait.detectNature(result.series))
             val progress=library.progress(series.id)
             val target=ResumePlayback.target(result.episodes,progress?.episodeId,progress?.position ?: 0,progress?.completed==true)
             episodeIndex=target.index; group=episodeIndex/20
@@ -779,10 +902,26 @@ class MainActivity: Activity() {
         val body=base("剧集详情")
         val scroll=ScrollView(this).apply { isVerticalScrollBarEnabled=false }; val content=column(); scroll.addView(content); body.addView(scroll,lp(-1,0).apply { weight=1f })
         val hero=row(); hero.gravity=Gravity.TOP; hero.setPadding(0,dp(12),0,dp(12))
-        val image=ImageView(this).apply { scaleType=ImageView.ScaleType.FIT_CENTER }; hero.addView(image,lp(dp(123),dp(174)).apply { rightMargin=dp(24) }); loadCover(image,data.series.cover)
+        val heroArtwork=FrameLayout(this)
+        val image=ImageView(this).apply { scaleType=ImageView.ScaleType.FIT_CENTER }
+        heroArtwork.addView(image,FrameLayout.LayoutParams(-1,-1))
+        val heroNature=SeriesMediaTrait.detectNature(data.series)
+        val heroOrient=SeriesMediaTrait.detectOrientation(data.series)
+        heroArtwork.addView(text(heroNature.label,11f).apply {
+            setTypeface(null,Typeface.BOLD); setTextColor(Color.WHITE)
+            setPadding(dp(6),dp(3),dp(6),dp(3)); background=TvStyle.badge(this@MainActivity,heroNature.badgeColor,radius=4)
+        },FrameLayout.LayoutParams(-2,-2,Gravity.TOP or Gravity.START).apply { topMargin=dp(6); leftMargin=dp(6) })
+        heroArtwork.addView(text(heroOrient.ratioText,10f,Color.rgb(241,245,249)).apply {
+            setTypeface(null,Typeface.BOLD); gravity=Gravity.CENTER_VERTICAL
+            compoundDrawablePadding=dp(5)
+            setCompoundDrawables(TvStyle.screenFrame(this@MainActivity,heroOrient.isLandscape),null,null,null)
+            setPadding(dp(7),dp(3),dp(7),dp(3)); background=TvStyle.badge(this@MainActivity,TvStyle.orientationBadgeBg,radius=4,border=TvStyle.orientationBadgeBorder,strokeDp=0.8f)
+        },FrameLayout.LayoutParams(-2,-2,Gravity.BOTTOM or Gravity.END).apply { bottomMargin=dp(6); rightMargin=dp(6) })
+        hero.addView(heroArtwork,lp(dp(123),dp(174)).apply { rightMargin=dp(24) })
+        loadCover(image,data.series.cover)
         val info=column(); hero.addView(info,lp(0,-2).apply { weight=1f })
         info.addView(text(data.series.title,26f).apply { setTypeface(null,Typeface.BOLD); maxLines=2; ellipsize=TextUtils.TruncateAt.END })
-        info.addView(text("${data.episodes.size} 集  ·  ${data.series.tags}",13f,muted).apply { maxLines=1; setPadding(0,dp(8),0,dp(8)) })
+        info.addView(text("${data.episodes.size} 集  ·  ${heroNature.label}短剧  ·  ${heroOrient.label}（${heroOrient.ratioText}）  ·  ${data.series.tags}",13f,muted).apply { maxLines=1; setPadding(0,dp(8),0,dp(8)) })
         val description=data.series.description.ifBlank { "选择剧集开始观看" }
         val synopsis=text(description,15f,muted).apply { maxLines=if(synopsisExpanded) 20 else 2; ellipsize=TextUtils.TruncateAt.END }
         info.addView(synopsis)
@@ -807,11 +946,38 @@ class MainActivity: Activity() {
             synopsisButton.post { synopsisButton.requestRectangleOnScreen(android.graphics.Rect(0,0,synopsisButton.width,synopsisButton.height),false) }
         }
         content.addView(hero)
+        val seasonButtons = mutableListOf<View>()
+        val seasonsPerRow = 8
+        if(detailSeasons.size > 1) {
+            val seasonSection = row().apply { gravity = Gravity.TOP; setPadding(0, dp(4), 0, dp(6)) }
+            seasonSection.addView(text("同系列各季：", 14f, muted).apply { setPadding(0, dp(8), dp(8), dp(8)) })
+            val seasonGrid = column()
+            seasonSection.addView(seasonGrid, lp(0, -2).apply { weight = 1f })
+            val baseTitle = SeriesSeasons.base(data.series.title)
+            detailSeasons.chunked(seasonsPerRow).forEach { chunk ->
+                val line = row().apply { setPadding(0, 0, 0, dp(6)) }
+                chunk.forEach { s ->
+                    val isCurrent = s.id == data.series.id
+                    val label = SeriesSeasons.label(s.title, baseTitle) + (if (isCurrent) "（当前）" else "")
+                    val btn = addButton(line, label, isCurrent) {
+                        if (!isCurrent) openDetail(s, resume = false, autoplay = false)
+                    }.apply {
+                        textSize = 13f
+                        minHeight = dp(34)
+                        setPadding(dp(11), dp(6), dp(11), dp(6))
+                        contentDescription = s.title + (if (isCurrent) "，当前季" else "")
+                    }
+                    seasonButtons += btn
+                }
+                seasonGrid.addView(line)
+            }
+            content.addView(seasonSection)
+        }
         val groupRow=row(); groupRow.setPadding(0,dp(3),0,dp(5))
         val maxGroup=data.episodes.lastIndex/20; group=group.coerceIn(0,maxGroup)
         val previous=addButton(groupRow,"‹ 上一组") { if(group>0) { group--; showDetail(true) } }.apply { isEnabled=group>0; isFocusable=group>0; alpha=if(group>0) 1f else .4f }
         groupRow.addView(text("第 ${group*20+1}—${minOf((group+1)*20,data.episodes.size)} 集",16f).apply { gravity=Gravity.CENTER },lp(dp(190),dp(42)))
-        addButton(groupRow,"下一组 ›") { if(group<maxGroup) { group++; showDetail(true) } }.apply { isEnabled=group<maxGroup; isFocusable=group<maxGroup; alpha=if(group<maxGroup) 1f else .4f }
+        val nextGroupBtn=addButton(groupRow,"下一组 ›") { if(group<maxGroup) { group++; showDetail(true) } }.apply { isEnabled=group<maxGroup; isFocusable=group<maxGroup; alpha=if(group<maxGroup) 1f else .4f }
         lateinit var jump: TextView
         jump=addButton(groupRow,"跳转集数") { tvTools.episodePicker(data.episodes.size,episodeIndex,jump) { target -> episodeIndex=target; group=target/20; showDetail(true) } }
         content.addView(groupRow)
@@ -822,7 +988,40 @@ class MainActivity: Activity() {
             repeat(10-numbers.size) { line.addView(Space(this),lp(0,dp(42)).apply { weight=1f; rightMargin=dp(6) }) }
             content.addView(line,lp(-1,dp(49)))
         }
-        episodes.forEachIndexed { i,v -> v.nextFocusLeftId=if(i%10==0) v.id else episodes[i-1].id; v.nextFocusRightId=if(i%10==9 || i==episodes.lastIndex) v.id else episodes[i+1].id; if(i>=10) v.nextFocusUpId=episodes[i-10].id; v.nextFocusDownId=if(i+10<episodes.size) episodes[i+10].id else v.id }
+        val actionButtons = listOf(play, favorite, synopsisButton)
+        val groupButtons = listOf(previous, nextGroupBtn, jump).filter { it.isFocusable }
+        val firstGroupTarget = groupButtons.firstOrNull() ?: episodes.firstOrNull() ?: play
+        actionButtons.forEachIndexed { idx, v ->
+            v.nextFocusLeftId = if (idx == 0) v.id else actionButtons[idx - 1].id
+            v.nextFocusRightId = if (idx == actionButtons.lastIndex) v.id else actionButtons[idx + 1].id
+            v.nextFocusDownId = seasonButtons.firstOrNull()?.id ?: firstGroupTarget.id
+        }
+        seasonButtons.forEachIndexed { i, v ->
+            val col = i % seasonsPerRow
+            v.nextFocusLeftId = if (col == 0) v.id else seasonButtons[i - 1].id
+            v.nextFocusRightId = if (col == seasonsPerRow - 1 || i == seasonButtons.lastIndex) v.id else seasonButtons[i + 1].id
+            v.nextFocusUpId = if (i < seasonsPerRow) play.id else seasonButtons[i - seasonsPerRow].id
+            v.nextFocusDownId = if (i + seasonsPerRow < seasonButtons.size) {
+                seasonButtons[i + seasonsPerRow].id
+            } else if (i / seasonsPerRow < seasonButtons.lastIndex / seasonsPerRow) {
+                seasonButtons.last().id
+            } else {
+                firstGroupTarget.id
+            }
+        }
+        val upFromGroup = seasonButtons.firstOrNull()?.id ?: play.id
+        groupButtons.forEachIndexed { idx, v ->
+            v.nextFocusLeftId = if (idx == 0) v.id else groupButtons[idx - 1].id
+            v.nextFocusRightId = if (idx == groupButtons.lastIndex) v.id else groupButtons[idx + 1].id
+            v.nextFocusUpId = upFromGroup
+            v.nextFocusDownId = episodes.firstOrNull()?.id ?: v.id
+        }
+        episodes.forEachIndexed { i,v ->
+            v.nextFocusLeftId=if(i%10==0) v.id else episodes[i-1].id
+            v.nextFocusRightId=if(i%10==9 || i==episodes.lastIndex) v.id else episodes[i+1].id
+            v.nextFocusUpId=if(i>=10) episodes[i-10].id else firstGroupTarget.id
+            v.nextFocusDownId=if(i+10<episodes.size) episodes[i+10].id else v.id
+        }
         if(focusEpisode) episodes.getOrNull((episodeIndex-group*20).coerceIn(0,episodes.lastIndex))?.requestFocus() else play.requestFocus()
     }
     private fun playEpisode(index: Int,position: Long=0,autoplay: Boolean=true,recovering: Boolean=false) {
@@ -869,7 +1068,7 @@ class MainActivity: Activity() {
             playbackTitle=text("",23f).apply { maxLines=1; ellipsize=TextUtils.TruncateAt.END; setTypeface(null,Typeface.BOLD) }; hud.addView(playbackTitle)
             playbackText=text("",15f,muted).apply { setPadding(0,dp(10),0,dp(9)) }; hud.addView(playbackText)
             progressBar=ProgressBar(this,null,android.R.attr.progressBarStyleHorizontal).apply { max=1000; progressTintList=android.content.res.ColorStateList.valueOf(accent); progressBackgroundTintList=android.content.res.ColorStateList.valueOf(surface) }; hud.addView(progressBar,lp(-1,dp(4)))
-            hud.addView(text("确认 暂停/播放    左右 快退/快进    ↓ 选集    ↑ 更多    返回 收起 / 退出",13f,muted).apply { setPadding(0,dp(12),0,0) })
+            hud.addView(text("确认 暂停/播放    左右 快退/快进    ↓ 选集/选季    ↑ 控制/选季    返回 收起 / 退出",13f,muted).apply { setPadding(0,dp(12),0,0) })
             controls=column().apply { setPadding(0,dp(12),0,0); visibility=View.GONE }; hud.addView(controls)
             root.addView(ScrollView(this).apply { isVerticalScrollBarEnabled=false; addView(hud) },FrameLayout.LayoutParams(-1,-2,Gravity.BOTTOM))
         } else {
@@ -880,8 +1079,29 @@ class MainActivity: Activity() {
         controls.removeAllViews(); controls.visibility=View.GONE; transportPlay=null; sleepButton=null
         syncMediaSession()
         val requestedId=data.episodes[episodeIndex]; val maxQuality=library.maxQuality; val ticket=generation
-        work({ prefetched ?: RemoteVideo(repository.http,repository.stream(requestedId,maxQuality)).prepare() }, { remote ->
+        work({
+            if (prefetched != null) {
+                android.util.Log.i("HongguoTV","playEpisode using prefetched stream for episode=${episodeIndex+1} id=$requestedId")
+                prefetched.prepare()
+            } else {
+                if(!library.deviceRegistered()) registerDeviceOnce()
+                android.util.Log.i("HongguoTV","playEpisode work starting for episode=${episodeIndex+1} id=$requestedId")
+                var streamInfo = runCatching { repository.stream(requestedId, maxQuality) }.getOrNull()
+                if (streamInfo == null) {
+                    android.util.Log.w("HongguoTV","Initial stream acquire failed, attempting re-registering device...")
+                    registerDeviceOnce(force = true)
+                    streamInfo = repository.stream(requestedId, maxQuality)
+                }
+                android.util.Log.i("HongguoTV","playEpisode stream acquired: url=${streamInfo.url} quality=${streamInfo.quality}")
+                val remote = RemoteVideo(repository.http, streamInfo).prepare()
+                android.util.Log.i("HongguoTV","playEpisode remote prepared: total=${remote.total}")
+                remote
+            }
+        }, { remote ->
             video=remote; quality=remote.info.quality
+            if(remote.info.width>0 && remote.info.height>0) {
+                SeriesMediaTrait.recordVideoDimension(data.series.id,remote.info.width,remote.info.height)
+            }
             val p=player ?: run {
                 val load=DefaultLoadControl.Builder().setBufferDurationsMs(15000,30000,1000,2000).setTargetBufferBytes(12*1024*1024).build()
                 val renderers=androidx.media3.exoplayer.DefaultRenderersFactory(this).setEnableDecoderFallback(true)
@@ -954,6 +1174,11 @@ class MainActivity: Activity() {
                         android.util.Log.i("HongguoTV","Playback first frame episode=${episodeIndex+1} preloaded=${prefetched!=null} reused=$reuse elapsedMs=${android.os.SystemClock.elapsedRealtime()-playbackStarted}")
                     }
                 }
+                override fun onVideoSizeChanged(videoSize: androidx.media3.common.VideoSize) {
+                    if(active() && videoSize.width>0 && videoSize.height>0) {
+                        SeriesMediaTrait.recordVideoDimension(data.series.id,videoSize.width,videoSize.height)
+                    }
+                }
                 override fun onIsPlayingChanged(playing: Boolean) { if(active()) { if(hud.visibility==View.VISIBLE) showHud(); syncMediaSession() } }
                 override fun onPlaybackParametersChanged(parameters: PlaybackParameters) { if(active()) syncMediaSession() }
                 override fun onPositionDiscontinuity(oldPosition: Player.PositionInfo,newPosition: Player.PositionInfo,reason: Int) { if(active()) syncMediaSession() }
@@ -962,7 +1187,10 @@ class MainActivity: Activity() {
             playerListener=listener; p.addListener(listener)
             val source=ProgressiveMediaSource.Factory { VideoDataSource(remote) }.createMediaSource(MediaItem.Builder().setMediaId(requestedId).setUri("hongguotv://episode/$requestedId").setMimeType(MimeTypes.VIDEO_MP4).build())
             p.setMediaSource(source); p.seekTo(position.coerceAtLeast(0)); p.prepare(); p.playWhenReady=foreground && requestedAutoplay && !pausedForLifecycle && episodePanel==null
-        }, { problem -> playerFailure(problem) })
+        }, { problem ->
+            android.util.Log.e("HongguoTV","playEpisode work error for episode=${episodeIndex+1}: ${problem.javaClass.name}: ${problem.message}", problem)
+            playerFailure(problem)
+        })
     }
     private fun closeTransport(http: okhttp3.OkHttpClient?) {
         if(http==null) return
@@ -1010,6 +1238,11 @@ class MainActivity: Activity() {
         val ticket=preparedNext.begin(key)
         val http=okhttp3.OkHttpClient.Builder().connectTimeout(8,java.util.concurrent.TimeUnit.SECONDS).readTimeout(15,java.util.concurrent.TimeUnit.SECONDS).callTimeout(20,java.util.concurrent.TimeUnit.SECONDS).build()
         val source=ContentRepository(http); prefetchHttp=http
+        source.inheritDevice(repository)
+        source.onDeviceRegistered = { registered ->
+            repository.inheritDevice(source)
+            library.saveDeviceIdentity(registered.deviceId, registered.installId)
+        }
         val scope=RequestScope(); prefetchScope=scope
         prefetchJob=prefetchWorker.submit {
             var remote: RemoteVideo?=null
@@ -1056,7 +1289,7 @@ class MainActivity: Activity() {
             addButton(controls,"停止自动重试") { cancelRecovery(); playbackText.text="自动重试已停止，观看位置已保留。" }
             autoRecovery=true; scheduleRecovery()
         }
-        android.util.Log.w("HongguoTV","Playback failure: ${problem.javaClass.simpleName}"+(if(problem is PlaybackException) " code=${problem.errorCodeName}" else ""))
+        android.util.Log.e("HongguoTV","Playback failure: ${problem.javaClass.name}: ${problem.message}"+(if(problem is PlaybackException) " code=${problem.errorCodeName}" else ""), problem)
     }
     private fun hidePlaybackOverlay() {
         main.removeCallbacks(hideHud)
@@ -1164,6 +1397,10 @@ class MainActivity: Activity() {
         val options=row().apply { setPadding(0,dp(8),0,0) }; controls.addView(options)
         lateinit var episodes: TextView
         episodes=addButton(options,"选集") { showEpisodePanel(episodes) }
+        if(detailSeasons.size>1) {
+            lateinit var seasonBtn: TextView
+            seasonBtn=addButton(options,"选季（共 ${detailSeasons.size} 季）") { showSeasonPicker(seasonBtn) }
+        }
         lateinit var more: TextView
         more=addButton(options,"播放设置") {
             tvTools.choose("播放设置",listOf("倍速 ${PlaybackSpeed.label(library.playbackSpeed)}","清晰度 ${library.maxQuality}P","画面 ${library.frameMode.label}","无缝换集 ${if(library.seamlessNext) "开启" else "关闭"}","定时 ${sleepTimer.label()}","从头播放"),more,{ choice ->
@@ -1222,6 +1459,22 @@ class MainActivity: Activity() {
         dialog.setOnDismissListener { if(anchor.isAttachedToWindow) anchor.requestFocus() }
         dialog.show()
     }
+    private fun showSeasonPicker(anchor: View) {
+        val data=detail ?: return
+        if(detailSeasons.size<=1) return
+        val baseTitle=SeriesSeasons.base(data.series.title)
+        val labels=detailSeasons.map { s ->
+            val isCurr=s.id==data.series.id
+            "${SeriesSeasons.label(s.title,baseTitle)}  ·  ${s.title}"+(if(isCurr) "（当前播放）" else "")
+        }
+        tvTools.choose("切换季数 · ${baseTitle}",labels,anchor,{ idx ->
+            val target=detailSeasons.getOrNull(idx) ?: return@choose
+            if(target.id!=data.series.id) {
+                sleepTimer.cancel(); sleepStopped=false; saveProgress(); library.flush(); invalidatePage(); releasePlayer()
+                openDetail(target,resume=true,autoplay=true)
+            }
+        })
+    }
     private fun showEpisodePanel(anchor: View) {
         val data=detail ?: return
         if(episodePanel!=null) return
@@ -1231,10 +1484,19 @@ class MainActivity: Activity() {
         player?.pause(); saveProgress()
         var resumeOnClose=true
         val next=EpisodePanel(this,data.episodes.size,episodeIndex,
+            detailSeasons,data.series.id,SeriesSeasons.base(data.series.title),
             { current,view,located -> tvTools.episodePicker(data.episodes.size,current,view,located) },
             { selected ->
                 if(selected==episodeIndex) episodePanel?.dismiss()
                 else { resumeOnClose=false; episodePanel?.dismiss(); playEpisode(selected) }
+            },
+            { targetSeason ->
+                if(targetSeason.id==data.series.id) episodePanel?.dismiss()
+                else {
+                    resumeOnClose=false; episodePanel?.dismiss()
+                    sleepTimer.cancel(); sleepStopped=false; saveProgress(); library.flush(); invalidatePage(); releasePlayer()
+                    openDetail(targetSeason,resume=true,autoplay=true)
+                }
             },
             {
                 episodePanel=null

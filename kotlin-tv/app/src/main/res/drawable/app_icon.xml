@@ -1,6 +1,165 @@
-<vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="108dp" android:height="108dp" android:viewportWidth="108" android:viewportHeight="108">
-    <path android:fillColor="#101016" android:pathData="M0,0H108V108H0Z"/>
-    <path android:fillColor="#FF694F" android:pathData="M54,25C20,18 15,48 25,71C33,90 50,91 54,85C58,91 75,90 83,71C93,48 88,18 54,25Z"/>
-    <path android:fillColor="#9BC67D" android:pathData="M54,25Q55,8 77,11Q70,29 54,25Z"/>
-    <path android:fillColor="#FFFFFF" android:pathData="M45,43L45,71L68,57Z"/>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- 1. Deep Midnight Royal Indigo Outer Squircle -->
+    <path
+        android:pathData="M24,6 L84,6 C94,6 102,14 102,24 L102,84 C102,94 94,102 84,102 L24,102 C14,102 6,94 6,84 L6,24 C6,14 14,6 24,6 Z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:startX="10"
+                android:startY="8"
+                android:endX="98"
+                android:endY="100"
+                android:type="linear">
+                <item android:offset="0.0" android:color="#FF0F172A"/>
+                <item android:offset="0.5" android:color="#FF1E1B4B"/>
+                <item android:offset="1.0" android:color="#FF090D16"/>
+            </gradient>
+        </aapt:attr>
+    </path>
+
+    <!-- 2. Ambient Electric Cyan & Gold Dual Glow -->
+    <path
+        android:pathData="M54,12 A42,42 0 1,1 53.9,12 Z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:centerX="54"
+                android:centerY="54"
+                android:gradientRadius="44"
+                android:type="radial">
+                <item android:offset="0.0" android:color="#5538BDF8"/>
+                <item android:offset="0.55" android:color="#28F59E0B"/>
+                <item android:offset="1.0" android:color="#00090D16"/>
+            </gradient>
+        </aapt:attr>
+    </path>
+
+    <!-- 3. Outer Metallic Gold-Cyan Frame Border -->
+    <path
+        android:pathData="M24,8.5 L84,8.5 C92.5,8.5 99.5,15.5 99.5,24 L99.5,84 C99.5,92.5 92.5,99.5 84,99.5 L24,99.5 C15.5,99.5 8.5,92.5 8.5,84 L8.5,24 C8.5,15.5 15.5,8.5 24,8.5 Z"
+        android:strokeWidth="2.2"
+        android:fillColor="#00000000">
+        <aapt:attr name="android:strokeColor">
+            <gradient
+                android:startX="12"
+                android:startY="12"
+                android:endX="96"
+                android:endY="96"
+                android:type="linear">
+                <item android:offset="0.0" android:color="#FF38BDF8"/>
+                <item android:offset="0.5" android:color="#FFFBBF24"/>
+                <item android:offset="1.0" android:color="#FFF43F5E"/>
+            </gradient>
+        </aapt:attr>
+    </path>
+
+    <!-- 4. TV Signal Crown / Golden Antenna Wings at Top -->
+    <path
+        android:pathData="M37,25 L48,34 L54,29 L60,34 L71,25"
+        android:strokeWidth="3.5"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:fillColor="#00000000">
+        <aapt:attr name="android:strokeColor">
+            <gradient
+                android:startX="37"
+                android:startY="25"
+                android:endX="71"
+                android:endY="34"
+                android:type="linear">
+                <item android:offset="0.0" android:color="#FF38BDF8"/>
+                <item android:offset="0.5" android:color="#FFFDE047"/>
+                <item android:offset="1.0" android:color="#FFFB923C"/>
+            </gradient>
+        </aapt:attr>
+    </path>
+
+    <!-- 5. 3D Widescreen TV Body Shadow -->
+    <path
+        android:fillColor="#88020617"
+        android:pathData="M26,35 L82,35 C87,35 91,39 91,44 L91,73 C91,78 87,82 82,82 L26,82 C21,82 17,78 17,73 L17,44 C17,39 21,35 26,35 Z"/>
+
+    <!-- 6. 3D Widescreen TV Bezel (Golden-Amber & Coral Gradient) -->
+    <path
+        android:pathData="M26,32 L82,32 C87,32 91,36 91,41 L91,70 C91,75 87,79 82,79 L26,79 C21,79 17,75 17,70 L17,41 C17,36 21,32 26,32 Z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:startX="17"
+                android:startY="32"
+                android:endX="91"
+                android:endY="79"
+                android:type="linear">
+                <item android:offset="0.0" android:color="#FFFDE047"/>
+                <item android:offset="0.45" android:color="#FFF59E0B"/>
+                <item android:offset="1.0" android:color="#FFEF4444"/>
+            </gradient>
+        </aapt:attr>
+    </path>
+
+    <!-- 7. Inner Deep Glass Screen -->
+    <path
+        android:pathData="M28,36.5 L80,36.5 C83.5,36.5 86.5,39.5 86.5,43 L86.5,68 C86.5,71.5 83.5,74.5 80,74.5 L28,74.5 C24.5,74.5 21.5,71.5 21.5,68 L21.5,43 C21.5,39.5 24.5,36.5 28,36.5 Z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:startX="22"
+                android:startY="36"
+                android:endX="86"
+                android:endY="74"
+                android:type="linear">
+                <item android:offset="0.0" android:color="#FF0F172A"/>
+                <item android:offset="0.5" android:color="#FF1E293B"/>
+                <item android:offset="1.0" android:color="#FF090D16"/>
+            </gradient>
+        </aapt:attr>
+    </path>
+
+    <!-- 8. Screen Top Glass Reflection -->
+    <path
+        android:fillColor="#24FFFFFF"
+        android:pathData="M28,36.5 L80,36.5 C83.5,36.5 86.5,39.5 86.5,43 L86.5,50 C66,55 42,52 21.5,46 L21.5,43 C21.5,39.5 24.5,36.5 28,36.5 Z"/>
+
+    <!-- 9. Glowing Cyan-Gold 3D Play Prism inside Screen -->
+    <path
+        android:pathData="M45,44.5 L68,55.5 L45,66.5 Z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:startX="45"
+                android:startY="44"
+                android:endX="68"
+                android:endY="66"
+                android:type="linear">
+                <item android:offset="0.0" android:color="#FF38BDF8"/>
+                <item android:offset="0.55" android:color="#FFFDE047"/>
+                <item android:offset="1.0" android:color="#FFF97316"/>
+            </gradient>
+        </aapt:attr>
+    </path>
+
+    <!-- 10. Sleek Cinema Stand Base -->
+    <path
+        android:pathData="M38,85 L70,85"
+        android:strokeWidth="4.2"
+        android:strokeLineCap="round">
+        <aapt:attr name="android:strokeColor">
+            <gradient
+                android:startX="38"
+                android:startY="85"
+                android:endX="70"
+                android:endY="85"
+                android:type="linear">
+                <item android:offset="0.0" android:color="#FF38BDF8"/>
+                <item android:offset="0.5" android:color="#FFFDE047"/>
+                <item android:offset="1.0" android:color="#FF38BDF8"/>
+            </gradient>
+        </aapt:attr>
+    </path>
+    <path
+        android:pathData="M54,79 L54,85"
+        android:strokeWidth="4.2"
+        android:strokeLineCap="round"
+        android:strokeColor="#FFFBBF24"/>
 </vector>

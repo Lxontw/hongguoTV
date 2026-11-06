@@ -25,8 +25,12 @@ import java.io.IOException
 import java.util.concurrent.Executors
 import java.util.concurrent.Future
 
-/** Foreground-only updater: no background service, and no networking or prompts during playback. */
-class AppUpdater(private val activity: Activity, private val idle: () -> Boolean) {
+/** Foreground-only updater: checks once on startup and prompts without automatic background downloading. */
+class AppUpdater(
+    private val activity: Activity,
+    private val idle: () -> Boolean,
+    private val onStateChanged: () -> Unit = {}
+) {
     private val main = Handler(Looper.getMainLooper())
     private val worker = Executors.newSingleThreadExecutor()
     private val repository = AppUpdateRepository()
@@ -41,30 +45,35 @@ class AppUpdater(private val activity: Activity, private val idle: () -> Boolean
     private var permissionRequested = false
     private var dialog: AlertDialog? = null
     val showing get() = dialog?.isShowing == true
+    val hasUpdate get() = available != null
+    val availableVersionName: String? get() = available?.versionName
     private var statusView: TextView? = null
     private var anchor: View? = null
     private var status = "当前版本 ${BuildConfig.VERSION_NAME}"
-    private var retryAfter = 0L
+    private var startupChecked = false
     private var promptedCode = 0L
     private val auto get() = preferences.getBoolean("automatic", true)
-    private val poll = object : Runnable {
+
+    private val startupCheck = object : Runnable {
         override fun run() {
-            if (!active) return
-            if (idle() && dialog == null && !busy && auto) {
-                val now = System.currentTimeMillis()
-                val last = preferences.getLong("last_attempt", 0)
-                val update = available
-                when {
-                    ready && update != null && promptedCode != update.versionCode && !deferred(update) -> { promptedCode = update.versionCode; show(activity.currentFocus) }
-                    update != null && !ready && now >= retryAfter -> download(false)
-                    now < last || now - last >= 6 * 60 * 60 * 1000L -> check(false)
-                }
+            if (!active || startupChecked) return
+            if (!idle()) {
+                main.postDelayed(this, 3000)
+                return
             }
-            main.postDelayed(this, 15000)
+            if (auto && dialog == null && !busy) {
+                startupChecked = true
+                check(false)
+            }
         }
     }
+
     fun resume() {
-        active = true; main.removeCallbacks(poll); main.postDelayed(poll, 8000)
+        active = true
+        main.removeCallbacks(startupCheck)
+        if (!startupChecked) {
+            main.postDelayed(startupCheck, 2500)
+        }
         if (permissionRequested) {
             permissionRequested = false
             if (activity.packageManager.canRequestPackageInstalls()) install()
@@ -72,7 +81,7 @@ class AppUpdater(private val activity: Activity, private val idle: () -> Boolean
         }
     }
     fun pause() {
-        active = false; main.removeCallbacks(poll); interrupt()
+        active = false; main.removeCallbacks(startupCheck); interrupt()
         dialog?.dismiss()
     }
     fun interrupt() {
@@ -101,14 +110,14 @@ class AppUpdater(private val activity: Activity, private val idle: () -> Boolean
         statusView = TextView(activity).apply { text = status; textSize = 17f; setTextColor(TvStyle.text) }
         body.addView(statusView)
         body.addView(CheckBox(activity).apply {
-            text = "自动检查并下载更新"; isChecked = auto
+            text = "应用启动时自动检查并提醒更新"; isChecked = auto
             setOnCheckedChangeListener { _, enabled ->
                 preferences.edit().putBoolean("automatic", enabled).apply()
-                if (!enabled && busy) { interrupt(); updateStatus("自动更新已关闭，可手动检查"); renderActions() }
+                if (!enabled && busy) { interrupt(); updateStatus("自动检查已关闭，可手动点击下方按钮检查"); renderActions() }
             }
         })
         body.addView(TextView(activity).apply {
-            text = "只在应用前台浏览时检查，播放中不打扰。下载后需确认系统安装，收藏与观看记录保留。"; textSize = 13f; setTextColor(TvStyle.muted)
+            text = "仅在应用启动时检查一次并提醒，播放中绝不打扰。点击下载并安装后，收藏与观看记录完整保留。"; textSize = 13f; setTextColor(TvStyle.muted)
             setPadding(0, (8*dp).toInt(), 0, (8*dp).toInt())
         })
         val next = AlertDialog.Builder(activity).setTitle("版本与更新 · ${BuildConfig.VERSION_NAME}").setView(ScrollView(activity).apply { addView(body) })
@@ -126,6 +135,9 @@ class AppUpdater(private val activity: Activity, private val idle: () -> Boolean
         }
         renderActions()
         next.getButton(AlertDialog.BUTTON_POSITIVE).post { if (dialog === next) next.getButton(AlertDialog.BUTTON_POSITIVE).requestFocus() }
+        if (!busy && available == null) {
+            check(false)
+        }
     }
     private fun <T> work(action: () -> T, done: (T) -> Unit) {
         busy = true; renderActions(); val ticket = ++generation
@@ -135,7 +147,7 @@ class AppUpdater(private val activity: Activity, private val idle: () -> Boolean
                 main.post { if (active && generation == ticket) { busy = false; done(result); renderActions() } }
             } catch (e: Exception) {
                 main.post { if (active && generation == ticket) {
-                    busy = false; ready = false; retryAfter = System.currentTimeMillis()+30*60*1000L
+                    busy = false; ready = false
                     updateStatus(if (e is IOException) e.message ?: "更新失败，请重试" else "更新校验失败，请重试"); renderActions()
                 } }
             }
@@ -147,12 +159,18 @@ class AppUpdater(private val activity: Activity, private val idle: () -> Boolean
         updateStatus("正在检查新版…")
         work({ repository.latest() }) { update ->
             available = update.takeIf { it.newerThan(BuildConfig.VERSION_CODE.toLong(), Build.VERSION.SDK_INT) }; ready = false
+            onStateChanged()
             if (available == null) {
                 updateStatus(if (update.versionCode > BuildConfig.VERSION_CODE && update.minSdk > Build.VERSION.SDK_INT) "新版需要 Android API ${update.minSdk}，当前电视继续使用本版" else "已是最新版本 ${BuildConfig.VERSION_NAME}")
                 worker.execute { apk.delete() }
             } else {
-                updateStatus("发现 ${update.versionName} · ${"%.1f".format(update.size/1048576.0)} MB\n${update.notes}")
-                if (manual || auto) download(manual)
+                updateStatus("发现新版本 ${update.versionName}（${"%.1f".format(update.size/1048576.0)} MB）\n${update.notes}\n\n按「下载新版」即可自动下载并安装。")
+                if (manual) {
+                    download(true)
+                } else if (idle() && dialog == null && promptedCode != update.versionCode && !deferred(update)) {
+                    promptedCode = update.versionCode
+                    show(activity.currentFocus)
+                }
             }
         }
     }
@@ -166,7 +184,13 @@ class AppUpdater(private val activity: Activity, private val idle: () -> Boolean
             validateApk(update)
         }) {
             ready = true; updateStatus("${update.versionName} 已下载并校验\n${update.notes}\n\n确认后由系统覆盖安装，保留本机记录。")
-            if (idle() && dialog == null && (manual || !deferred(update))) { promptedCode = update.versionCode; show(activity.currentFocus) }
+            onStateChanged()
+            if (manual && active) {
+                install()
+            } else if (idle() && dialog == null && !deferred(update)) {
+                promptedCode = update.versionCode
+                show(activity.currentFocus)
+            }
         }
     }
     @Suppress("DEPRECATION")
@@ -190,11 +214,24 @@ class AppUpdater(private val activity: Activity, private val idle: () -> Boolean
             try {
                 if (!activity.packageManager.canRequestPackageInstalls()) {
                     permissionRequested = true
-                    activity.startActivity(Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:${activity.packageName}")))
+                    val intents = listOf(
+                        Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:${activity.packageName}")),
+                        Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES),
+                        Intent(Settings.ACTION_SECURITY_SETTINGS)
+                    )
+                    var launched = false
+                    for (intent in intents) {
+                        if (runCatching { activity.startActivity(intent) }.isSuccess) {
+                            launched = true
+                            break
+                        }
+                    }
+                    if (!launched) throw IOException("无法打开未知来源授权设置")
                 } else {
                     val uri = FileProvider.getUriForFile(activity, "${activity.packageName}.updates", apk)
                     activity.startActivity(Intent(Intent.ACTION_VIEW).setDataAndType(uri, "application/vnd.android.package-archive")
-                        .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION).apply { clipData = ClipData.newRawUri("更新安装包", uri) })
+                        .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+                        .apply { clipData = ClipData.newRawUri("更新安装包", uri) })
                 }
             } catch (_: Exception) { permissionRequested = false; updateStatus("电视未提供安装或授权入口，请通过系统文件管理器安装新版") }
         }

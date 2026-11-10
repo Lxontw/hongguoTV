@@ -113,6 +113,21 @@ class ContentRepositoryTest {
         assertEquals("720P", result.quality)
     }
 
+    @Test fun heicNovelPicCoverUrlIsNormalizedToPublic640Jpeg() {
+        val raw = "https:\\u002F\\u002Fp3-novel.fqnovelpic.com\\u002Fnovel-pic\\u002Fabc123def~tplv-resize:300:0.heic?rk3s=123&amp;x-expires=999"
+        assertEquals(
+            "https://p3-novel.byteimg.com/novel-pic/abc123def~tplv-shrink:640:0.image",
+            normalizeCoverUrl(raw)
+        )
+    }
+
+    @Test fun nonHeicOrExternalCoverUrlRemainsUnchangedAfterClean() {
+        val raw = "https:\\/\\/example.com\\/cover.jpg?a=1&amp;b=2"
+        assertEquals("https://example.com/cover.jpg?a=1&b=2", normalizeCoverUrl(raw))
+        val otherHeic = "https://example.com/novel-pic/abc~123.heic"
+        assertEquals(otherHeic, normalizeCoverUrl(otherHeic))
+    }
+
     private fun repository(clock: () -> Long = System::currentTimeMillis, respond: (Request) -> String) = ContentRepository(
         OkHttpClient.Builder().addInterceptor { chain ->
             Response.Builder().request(chain.request()).protocol(Protocol.HTTP_1_1)
@@ -331,5 +346,61 @@ class ContentRepositoryTest {
         val problem=assertThrows(IOException::class.java) { repo.search("修仙",1,ContentType.COMIC) }
         assertFalse(problem is org.json.JSONException)
         assertEquals("搜索接口暂不可用",problem.message)
+    }
+
+    @Test fun appCategoryCatalogExtractsThemesNewTodayBadgeAndCursor() {
+        val requests = mutableListOf<Request>()
+        val repo = repository { request ->
+            requests += request
+            assertEquals("/reading/distribution/category/landpage/v/", request.url.encodedPath)
+            assertEquals("73532", request.url.queryParameter("version_code"))
+            assertEquals("7.3.5.32", request.url.queryParameter("version_name"))
+            if (requests.size == 1) {
+                JSONObject().put("code", 0).put("data", JSONObject()
+                    .put("has_more", true)
+                    .put("next_offset", 20)
+                    .put("session_id", "cat-sess-1")
+                    .put("selector_rows", JSONArray().put(
+                        JSONObject().put("type", "category_dim_theme").put("items", JSONArray()
+                            .put(JSONObject().put("selector_item_id", "cate_14000018").put("show_name", "奇幻玄幻"))
+                            .put(JSONObject().put("selector_item_id", "invalid_slug").put("show_name", "非法项")))
+                    ))
+                    .put("video_data", JSONArray().put(
+                        JSONObject()
+                            .put("series_id", "888")
+                            .put("title", "新番漫剧")
+                            .put("content_type", 1004)
+                            .put("episode_cnt", 36)
+                            .put("cover", "https://p3-novel.fqnovelpic.com/novel-pic/xyz~tplv-resize:300:0.heic")
+                            .put("tag_info", JSONObject().put("text", "今日上新"))
+                            .put("sub_title_list", JSONArray().put(JSONObject().put("content", "玄幻")).put(JSONObject().put("content", "系统")))
+                    ))
+                ).toString()
+            } else {
+                JSONObject().put("code", 0).put("data", JSONObject()
+                    .put("has_more", false)
+                    .put("next_offset", 20)
+                    .put("session_id", "cat-sess-1")
+                    .put("video_data", JSONArray().put(
+                        JSONObject().put("series_id", "889").put("title", "第二页漫剧").put("content_type", 1004).put("episode_cnt", 10)
+                    ))
+                ).toString()
+            }
+        }
+        val page1 = repo.home(1, ContentType.COMIC, "cate_14000018")
+        assertEquals(3, page1.genres.size)
+        assertEquals("cate_14000018", page1.genres[2].id)
+        assertEquals("奇幻玄幻", page1.genres[2].label)
+        val item = page1.items.single()
+        assertEquals("888", item.id)
+        assertEquals("今日上新 · 全 36 集", item.badge)
+        assertEquals("玄幻 · 系统", item.tags)
+        assertEquals("https://p3-novel.byteimg.com/novel-pic/xyz~tplv-shrink:640:0.image", item.cover)
+        assertTrue(page1.hasMore)
+
+        val page2 = repo.home(2, ContentType.COMIC, "cate_14000018")
+        assertEquals("889", page2.items.single().id)
+        assertFalse(page2.hasMore)
+        assertEquals(3, page2.genres.size)
     }
 }

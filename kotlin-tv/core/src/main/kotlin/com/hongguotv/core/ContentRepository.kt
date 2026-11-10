@@ -13,6 +13,27 @@ import java.util.concurrent.TimeUnit
 internal fun JSONArray.objects() = (0 until length()).mapNotNull { optJSONObject(it) }
 internal fun JSONObject.str(key: String) = if (isNull(key)) "" else optString(key, "").trim()
 internal fun cleanUrl(s: String) = s.replace("\\/","/").replace("\\u002F","/",ignoreCase=true).replace("\\u0026","&").replace("&amp;","&")
+internal fun normalizeCoverUrl(raw: String): String {
+    val cleaned = cleanUrl(raw).trim()
+    if (cleaned.isEmpty()) return ""
+    return runCatching {
+        val uri = java.net.URI(cleaned)
+        val scheme = uri.scheme?.lowercase().orEmpty()
+        val host = uri.host?.lowercase().orEmpty()
+        val path = uri.rawPath.orEmpty()
+        if (scheme in setOf("http", "https") &&
+            path.endsWith(".heic", ignoreCase = true) &&
+            (host == "fqnovelpic.com" || host.endsWith(".fqnovelpic.com") || host == "byteimg.com" || host.endsWith(".byteimg.com")) &&
+            path.startsWith("/novel-pic/") &&
+            path.contains('~')
+        ) {
+            val prefix = path.substringBefore('~')
+            "https://p3-novel.byteimg.com$prefix~tplv-shrink:640:0.image"
+        } else {
+            cleaned
+        }
+    }.getOrDefault(cleaned)
+}
 data class Series(val id: String, val title: String, val cover: String = "", val description: String = "", val badge: String = "", val tags: String = "", val isAi: Boolean? = null, val isLandscape: Boolean? = null) {
     fun toJson() = JSONObject().put("id",id).put("title",title).put("cover",cover).put("description",description).put("badge",badge).put("tags",tags)
         .apply {
@@ -30,15 +51,20 @@ data class Series(val id: String, val title: String, val cover: String = "", val
 data class Detail(val series: Series, val episodes: List<String>)
 data class RankPosition(val rank: Int?, val heat: String)
 data class ComicRanking(val positions: Map<String,RankPosition>, val totalPages: Int, val updatedText: String)
-data class CatalogPage(val items: List<Series>, val hasMore: Boolean, val ranking: ComicRanking? = null)
+data class CatalogPage(val items: List<Series>, val hasMore: Boolean, val ranking: ComicRanking? = null, val genres: List<GenreFilter> = emptyList())
 data class StreamInfo(val url: String, val key: ByteArray?, val quality: String, val width: Int = 0, val height: Int = 0)
 class SearchSessionExpiredException: IOException("搜索结果已过期，请从第 1 页重新搜索")
 
 class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectTimeout(15,TimeUnit.SECONDS).readTimeout(30,TimeUnit.SECONDS).callTimeout(45,TimeUnit.SECONDS).build(), private val clock: () -> Long = System::currentTimeMillis) {
     private val signer = Signer(clock)
     private val site = "https://hongguoduanju.com"
+    private val xifan = XifanRepository(http)
+    private val hema = HemaRepository(http)
     private data class SearchCursor(val searchId: String, val passback: String, val offset: Int?, val updatedAt: Long)
     private val searchCursors=linkedMapOf<Triple<ContentType,String,Int>,SearchCursor>()
+    private data class CategoryCursor(val offset: Int, val sessionId: String, val genres: List<GenreFilter>, val updatedAt: Long)
+    private val categoryCursors=linkedMapOf<Triple<ContentType,String,Int>,CategoryCursor>()
+    private val genreCache=java.util.concurrent.ConcurrentHashMap<ContentType,Pair<Long,List<GenreFilter>>>()
 
     @Volatile var deviceIdentity: Map<String,String> = emptyMap()
         set(value) { field=value.filterValues { it.isNotBlank() }; signer.updateDevice(deviceProfile()) }
@@ -139,7 +165,7 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
         return Series(
             o.str("series_id"),
             o.str("series_name").ifEmpty { o.str("series_title").ifEmpty { item.str("name") } },
-            cleanUrl(o.str("series_cover")),
+            normalizeCoverUrl(o.str("series_cover")),
             o.str("series_intro"),
             o.str("episode_right_text").ifEmpty { if(count>0) "全 ${count} 集" else "" },
             (0 until minOf(tags.length(),5)).joinToString(" · ") { tags.optJSONObject(it)?.str("name") ?: tags.optString(it) },
@@ -160,20 +186,96 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
         rankCache[page] = Pair(now, res)
         return res
     }
-    fun home(page: Int = 1, type: ContentType = ContentType.SHORT): CatalogPage {
+    fun categoryCatalog(page: Int = 1, type: ContentType = ContentType.COMIC, genreId: String = ""): CatalogPage {
         require(page in 1..100)
-        if(type==ContentType.COMIC) return comicRanking(page)
+        val normalizedGenre = genreId.trim()
+        val now = clock()
+        val prevCursor = synchronized(categoryCursors) {
+            categoryCursors.entries.removeAll { now - it.value.updatedAt > 300_000L || (page == 1 && it.key.first == type && it.key.second == normalizedGenre) }
+            categoryCursors[Triple(type, normalizedGenre, page - 1)]
+        }
+        if (page > 1 && prevCursor == null) {
+            return CatalogPage(emptyList(), false, genres = genreCache[type]?.second ?: emptyList())
+        }
+        val offset = if (page == 1) 0 else prevCursor!!.offset
+        val sessionId = if (page == 1) "" else prevCursor!!.sessionId
+        val previousGenres = prevCursor?.genres ?: genreCache[type]?.second ?: emptyList()
+
+        val values = LinkedHashMap(deviceProfile())
+        for (k in listOf("version_code", "manifest_version_code", "update_version_code", "pv_player")) values[k] = "73532"
+        values["version_name"] = "7.3.5.32"
+
+        val payloadBytes = AppCategoryCatalog.buildPayload(type, normalizedGenre, offset, sessionId, page)
+            .toString()
+            .toByteArray(Charsets.UTF_8)
+        val hosts = listOf(
+            "https://api5-normal-lf.fqnovel.com",
+            "https://api5-normal-lq.fqnovel.com"
+        )
+        var lastError: IOException? = null
+        for (host in hosts) {
+            val attempt = runCatching {
+                val signed = signer.sign(host + AppCategoryCatalog.CATEGORY_PATH, values, payloadBytes)
+                val rawText = text(signed.url, signed)
+                AppCategoryCatalog.parseResponse(rawText, type, offset, previousGenres)
+            }
+            val parsed = attempt.getOrNull()
+            if (parsed != null) {
+                if (parsed.genres.size > 2) {
+                    genreCache[type] = now to parsed.genres
+                }
+                if (parsed.hasMore && parsed.nextOffset != null) {
+                    synchronized(categoryCursors) {
+                        categoryCursors[Triple(type, normalizedGenre, page)] = CategoryCursor(
+                            offset = parsed.nextOffset,
+                            sessionId = parsed.sessionId,
+                            genres = parsed.genres,
+                            updatedAt = now
+                        )
+                        while (categoryCursors.size > 100) categoryCursors.remove(categoryCursors.keys.first())
+                    }
+                }
+                return CatalogPage(parsed.items, parsed.hasMore && page < 100, genres = parsed.genres)
+            }
+            val ex = attempt.exceptionOrNull()
+            lastError = ex as? IOException ?: IOException(ex?.message ?: "App 分类接口暂不可用", ex)
+        }
+        throw lastError ?: IOException("App 分类接口暂不可用")
+    }
+    fun defaultGenres(type: ContentType = ContentType.COMIC): List<GenreFilter> {
+        genreCache[type]?.second?.takeIf { it.isNotEmpty() }?.let { return it }
+        return AppCategoryCatalog.defaultGenresFor(type)
+    }
+    fun home(page: Int = 1, type: ContentType = ContentType.SHORT, genreId: String = "", source: MediaSource = MediaSource.HONGGUO): CatalogPage {
+        require(page in 1..100)
+        when (source) {
+            MediaSource.XIFAN -> return xifan.home(page, genreId)
+            MediaSource.HEMA -> return hema.home(page)
+            MediaSource.HONGGUO -> {}
+        }
+        if (genreId.isNotBlank()) {
+            return categoryCatalog(page, type, genreId)
+        }
+        if(type==ContentType.COMIC) {
+            val res = comicRanking(page)
+            return if (res.genres.isNotEmpty()) res else res.copy(genres = defaultGenres(type))
+        }
         val data=router("$site/category?tab=1&sort_type=1"+if(page>1) "&page=$page" else "")
         val section=data.optJSONObject("category_page") ?: data.optJSONObject("category_$") ?: throw IOException("首页数据结构已变化")
         val rows=section.optJSONArray("recommendList") ?: section.optJSONObject("categoryData")?.optJSONArray("recommendList") ?: throw IOException("首页数据暂不可用")
         val items=valid(rows.objects().map(::card))
         val lastPage=section.optJSONObject("pagination")?.optInt("totalPages",100) ?: 100
-        return CatalogPage(items,items.isNotEmpty() && page<minOf(lastPage,100))
+        return CatalogPage(items,items.isNotEmpty() && page<minOf(lastPage,100), genres = defaultGenres(type))
     }
-    fun search(keyword: String, page: Int = 1, type: ContentType = ContentType.SHORT): CatalogPage {
+    fun search(keyword: String, page: Int = 1, type: ContentType = ContentType.SHORT, source: MediaSource = MediaSource.HONGGUO): CatalogPage {
         require(keyword.isNotBlank() && keyword.length<=80 && page in 1..100)
         val normalized = ChineseConverter.toSimplified(keyword).trim()
         val query = if(normalized.isNotBlank()) normalized else keyword.trim()
+        when (source) {
+            MediaSource.XIFAN -> return xifan.search(query, page)
+            MediaSource.HEMA -> return hema.search(query, page)
+            MediaSource.HONGGUO -> {}
+        }
         // The website search does not constrain content type. Never use it for comics.
         if(type==ContentType.COMIC) return appSearch(query,page,type)
         try {
@@ -199,6 +301,8 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
     )
 
     fun searchSiblings(series: Series): List<Series> {
+        val source = MediaSource.fromSeriesOrEpisodeId(series.id)
+        if (source != MediaSource.HONGGUO) return listOf(series)
         val parsed = SeriesSeasons.parse(series.title)
         val base = if (!parsed.matched && (series.title.contains('：') || series.title.contains(':'))) {
             series.title.substringBefore('：').substringBefore(':').trim().ifEmpty { parsed.base }
@@ -294,7 +398,7 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
                     } else ""
                 }.getOrDefault("")
                 list+=Series(
-                    id,title,cleanUrl(video.str("cover").ifEmpty { video.str("cover_url") }),
+                    id,title,normalizeCoverUrl(video.str("cover").ifEmpty { video.str("cover_url") }),
                     video.str("video_desc").ifEmpty { detailObj?.str("series_intro").orEmpty() },
                     if(count>0) "全 $count 集" else video.str("rec_text"),
                     video.str("sub_title").ifEmpty { parsedTags },isAi=isAi,isLandscape=isLandscape
@@ -308,6 +412,11 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
         return CatalogPage(valid(list),tab.optBoolean("has_more",false) && page<100)
     }
     fun detail(id: String): Detail {
+        when (MediaSource.fromSeriesOrEpisodeId(id)) {
+            MediaSource.XIFAN -> return xifan.detail(id)
+            MediaSource.HEMA -> return hema.detail(id)
+            MediaSource.HONGGUO -> {}
+        }
         require(id.matches(Regex("[0-9]{1,30}")))
         val o=router("$site/detail?series_id=$id").optJSONObject("detail_page")?.optJSONObject("seriesDetail") ?: throw IOException("剧集详情暂不可用")
         val raw=o.optJSONArray("vid_list") ?: throw IOException("分集暂不可用")
@@ -494,6 +603,11 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
     }
 
     fun stream(id: String, maxQuality: Int = 1080): StreamInfo {
+        when (MediaSource.fromSeriesOrEpisodeId(id)) {
+            MediaSource.XIFAN -> return xifan.stream(id)
+            MediaSource.HEMA -> return hema.stream(id)
+            MediaSource.HONGGUO -> {}
+        }
         require(id.matches(Regex("[0-9]{1,30}")))
         val model = try {
             videoModel(id)
@@ -508,6 +622,31 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
         val stream = parseModelStreams(model, maxQuality)
         if (stream != null) return stream
         throw IOException("未找到可播放的视频流")
+    }
+
+    fun danmaku(videoId: String): List<DanmakuItem> {
+        if (!videoId.matches(Regex("[0-9]{1,30}"))) return emptyList()
+        return runCatching {
+            val rawItems = mutableListOf<DanmakuRaw>()
+            var offset = 0
+            val host = "https://api5-normal-sinfonlinea.fqnovel.com"
+            for (pageIdx in 0 until DanmakuRepository.MAX_PAGES) {
+                val values = LinkedHashMap(deviceProfile()).apply {
+                    put("offset", offset.toString())
+                    put("count", "30")
+                    put("sort_type", "1")
+                }
+                val signed = signer.sign("$host/novel/commentapi/comment/list/$videoId/v1/", values)
+                val rawText = text(signed.url, signed)
+                val (pageItems, hasMore, nextOffset) = DanmakuRepository.parsePage(rawText)
+                rawItems += pageItems
+                if (!hasMore) break
+                val next = nextOffset ?: (offset + 30)
+                if (next <= offset) break
+                offset = next
+            }
+            DanmakuRepository.mergeAndSort(rawItems)
+        }.getOrDefault(emptyList())
     }
     companion object {
         fun extractRouter(html: String): JSONObject {

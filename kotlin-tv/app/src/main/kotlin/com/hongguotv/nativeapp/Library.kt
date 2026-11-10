@@ -197,13 +197,19 @@ class Library(context: Context) {
     var seamlessNext: Boolean
         get() = state().settings.seamlessNext
         set(value) { if (value != seamlessNext) { state().settings = state().settings.copy(seamlessNext = value); put("seamlessNext", value) } }
+    var danmakuEnabled: Boolean
+        get() = state().settings.danmakuEnabled
+        set(value) { if (value != danmakuEnabled) { state().settings = state().settings.copy(danmakuEnabled = value); put("danmakuEnabled", value) } }
+    var mediaSource: MediaSource
+        get() = state().settings.mediaSource
+        set(value) { if (value != mediaSource) { state().settings = state().settings.copy(mediaSource = value); put("mediaSource", value.storedValue) } }
     fun snapshot() = state().snapshot()
     fun restore(incoming: BackupData, restoreSettings: Boolean) {
         val merged = LibraryBackup.merge(snapshot(), incoming, restoreSettings)
         index = LibraryIndex(merged, state().updates())
         persist("favorites", "later", "progress", "watched", "hidden", "searches", "favoriteUpdates")
         writes.submit(mapOf("quality" to { merged.settings.quality }, "playbackSpeed" to { merged.settings.speed },
-            "autoNext" to { merged.settings.autoNext }, "seamlessNext" to { merged.settings.seamlessNext }, "contentType" to { merged.settings.type.storedValue }, "frameMode" to { merged.settings.frame.name }))
+            "autoNext" to { merged.settings.autoNext }, "seamlessNext" to { merged.settings.seamlessNext }, "danmakuEnabled" to { merged.settings.danmakuEnabled }, "mediaSource" to { merged.settings.mediaSource.storedValue }, "contentType" to { merged.settings.type.storedValue }, "frameMode" to { merged.settings.frame.name }))
         flush()
     }
     /** Requests prompt background commit, without lifecycle-thread disk waits. */

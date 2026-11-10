@@ -101,10 +101,16 @@ object LibraryDisk {
         }
         val rawUpdates = runCatching { JSONObject(values["favoriteUpdates"] as? String ?: "{}") }.getOrDefault(JSONObject())
         val updates = rawUpdates.keys().asSequence().mapNotNull { id -> FavoriteUpdate.decode(rawUpdates.optJSONObject(id))?.let { id to it } }.toMap()
-        val settings = BackupSettings(PlaybackQuality.normalize((values["quality"] as? Number)?.toInt() ?: 1080),
-            PlaybackSpeed.normalize((values["playbackSpeed"] as? Number)?.toFloat() ?: 1f), values["autoNext"] as? Boolean ?: true,
-            ContentType.fromStored(values["contentType"] as? String), VideoFrameMode.fromStored(values["frameMode"] as? String),
-            values["seamlessNext"] as? Boolean ?: false)
+        val settings = BackupSettings(
+            PlaybackQuality.normalize((values["quality"] as? Number)?.toInt() ?: 1080),
+            PlaybackSpeed.normalize((values["playbackSpeed"] as? Number)?.toFloat() ?: 1f),
+            values["autoNext"] as? Boolean ?: true,
+            ContentType.fromStored(values["contentType"] as? String),
+            VideoFrameMode.fromStored(values["frameMode"] as? String),
+            values["seamlessNext"] as? Boolean ?: false,
+            values["danmakuEnabled"] as? Boolean ?: false,
+            MediaSource.fromStored(values["mediaSource"] as? String)
+        )
         return LibraryIndex(BackupData(series("favorites"), history, ids("watched"),
             SearchHistory.decode(values["searches"] as? String ?: "[]"), settings, series("later"), ids("hidden")), updates)
     }

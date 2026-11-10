@@ -120,6 +120,20 @@ class MainActivity: Activity() {
     private val sleepTimer=SleepTimer { android.os.SystemClock.elapsedRealtime() }
     private var sleepStopped=false
     private var playerView: PlayerView?=null
+    private var danmakuOverlay: DanmakuOverlayView?=null
+    private var danmakuJob: java.util.concurrent.Future<*>?=null
+    private val danmakuWorker=Executors.newSingleThreadExecutor()
+    private val danmakuTick=object: Runnable {
+        override fun run() {
+            if(!foreground || isDestroyed || screen!="player") return
+            val overlay=danmakuOverlay
+            val p=player
+            if(overlay!=null && library.danmakuEnabled && p!=null && playbackReady && !playError) {
+                overlay.syncPlayback(pendingSeek ?: p.currentPosition, p.isPlaying)
+            }
+            main.postDelayed(this, 80)
+        }
+    }
     private lateinit var favoriteMonitor: FavoriteMonitor
     private val favoriteBadges=mutableMapOf<String,TextView>()
     private var favoriteStatus: TextView?=null
@@ -172,6 +186,10 @@ class MainActivity: Activity() {
     private val tabFocus=mutableMapOf<Int,String>()
     private val nav=mutableListOf<View>()
     private val typeButtons=mutableMapOf<ContentType,View>()
+    private var sourceButton: TextView?=null
+    private var selectedGenreId=""
+    private var availableGenres: List<GenreFilter> = emptyList()
+    private val genreButtons=mutableMapOf<String,View>()
     private var searchInput: View?=null
     private var searchButton: View?=null
     private val searchActions=mutableListOf<View>()
@@ -305,7 +323,7 @@ class MainActivity: Activity() {
         catalogScroll?.let { scrollPositions[catalogPageKey]=it.scrollY }
         catalogBody=null
         homeScreen=null; selectionPreview=null; catalogScroll=null
-        nav.clear(); typeButtons.clear(); searchInput=null; searchButton=null; searchActions.clear()
+        nav.clear(); typeButtons.clear(); sourceButton=null; genreButtons.clear(); searchInput=null; searchButton=null; searchActions.clear()
         historyManage=null; rankRefresh=null; rankSubtitle=null; collectionBack=null; favoriteBadges.clear()
         favoriteStatus=null; favoriteCheck=null; homeUpdates=null; settingsUpdateButton=null; resumeCards.clear()
         catalogCards.clear(); cardImages.clear()
@@ -348,10 +366,48 @@ class MainActivity: Activity() {
         leaveCollection()
         (searchInput as? EditText)?.let { query=it.text.toString().trim() }
         library.contentType=type
+        selectedGenreId=""; availableGenres=emptyList()
         for(index in 0..1) { tabState.remove(index); tabFocus.remove(index) }
         releaseCatalogViews()
         page=1; catalog=emptyList(); hasMore=false; ranking=null; catalogFocus=""; homePosition=null
         showCatalog(load=(tab==0 || query.isNotBlank()),focusType=true)
+    }
+    private fun switchMediaSource(source: MediaSource) {
+        if(library.mediaSource==source) return
+        leaveCollection()
+        (searchInput as? EditText)?.let { query=it.text.toString().trim() }
+        library.mediaSource=source
+        selectedGenreId=""; availableGenres=emptyList()
+        for(index in 0..1) { tabState.remove(index); tabFocus.remove(index) }
+        releaseCatalogViews()
+        page=1; catalog=emptyList(); hasMore=false; ranking=null; catalogFocus=""; homePosition=null
+        showCatalog(load=(tab==0 || query.isNotBlank()),focusType=true)
+    }
+    private fun switchGenre(genreId: String) {
+        if(selectedGenreId==genreId) return
+        leaveCollection()
+        selectedGenreId=genreId
+        tabState.remove(0); tabFocus.remove(0)
+        releaseCatalogViews()
+        page=1; catalog=emptyList(); hasMore=false; ranking=null; catalogFocus=""; homePosition=null
+        showCatalog(load=true, focusGenre=true)
+    }
+    private fun showSourcePicker(anchor: TextView, inSettings: Boolean=false) {
+        val sources=MediaSource.entries
+        val labels=sources.map { "${it.label}剧场" + (if(library.mediaSource==it) "（当前）" else "") }
+        tvTools.choose("切换片源平台",labels,anchor,{ idx ->
+            val target=sources.getOrNull(idx) ?: return@choose
+            if(inSettings) {
+                if(library.mediaSource!=target) {
+                    library.mediaSource=target
+                    selectedGenreId=""; availableGenres=emptyList()
+                    for(index in 0..1) { tabState.remove(index); tabFocus.remove(index) }
+                }
+                anchor.text="默认片源平台  ·  ${library.mediaSource.label}"
+            } else {
+                switchMediaSource(target)
+            }
+        })
     }
     private fun leaveCollection() {
         if(collection==null) return
@@ -372,11 +428,11 @@ class MainActivity: Activity() {
         "resume" -> library.history().filterNot { library.watched(it.series.id) }.map { it.series }
         else -> if(tab==3) library.favorites() else library.history().map { it.series }
     }
-    private fun showCatalog(load: Boolean=false,focusNav: Boolean=false,focusType: Boolean=false) {
+    private fun showCatalog(load: Boolean=false,focusNav: Boolean=false,focusType: Boolean=false,focusGenre: Boolean=false) {
         initialCatalogPending=false; restoreStoppedPage=false; pendingDetail=null
         // Never cache a new page number with the previous page's results while a request is pending.
         if(load) {
-            val cached=if(tab==0 && page==1) library.cachedHome(library.contentType) else null
+            val cached=if(tab==0 && page==1 && selectedGenreId.isEmpty() && library.mediaSource==MediaSource.HONGGUO) library.cachedHome(library.contentType) else null
             catalog=cached?.items ?: emptyList(); hasMore=cached?.hasMore ?: false; ranking=null; homeFromCache=cached!=null
         }
         invalidatePage(); screen="catalog"; releaseCatalogViews(); val container=base()
@@ -409,15 +465,49 @@ class MainActivity: Activity() {
                 typeButtons[type]=addButton(types,type.label,library.contentType==type) { switchContentType(type) }
                     .apply { isSelected=library.contentType==type; nextFocusUpId=nav[tab].id }
             }
+            lateinit var srcBtn: TextView
+            srcBtn=addButton(types,"片源：${library.mediaSource.label}",library.mediaSource!=MediaSource.HONGGUO) { showSourcePicker(srcBtn,false) }
+                .apply { nextFocusUpId=nav[tab].id }
+            sourceButton=srcBtn
             if(inlineHomeFilters()) {
                 top.addView(Space(this),lp(0,1).apply { weight=1f })
-                typeButtons.values.forEach { view -> (view as TextView).apply { textSize=12f; minHeight=dp(34); setPadding(dp(12),dp(7),dp(12),dp(7)) } }
+                (typeButtons.values + listOfNotNull(sourceButton)).forEach { view -> (view as TextView).apply { textSize=12f; minHeight=dp(34); setPadding(dp(12),dp(7),dp(12),dp(7)) } }
                 types.setPadding(0,0,0,0); top.addView(types)
             } else {
                 if(tab==0) types.addView(text("长按确认 · 管理片单",12f,muted).apply { setPadding(dp(14),0,0,0) })
                 container.addView(types)
             }
             nav.forEach { it.nextFocusDownId=typeButtons.getValue(library.contentType).id }
+        }
+        if(tab==0 && collection==null && library.mediaSource!=MediaSource.HEMA) {
+            val genres=if(availableGenres.isNotEmpty()) availableGenres else if(library.mediaSource==MediaSource.XIFAN) {
+                listOf(GenreFilter("","全部推荐"),GenreFilter(AppCategoryCatalog.NEW_TODAY_ID,"今日上新"))
+            } else repository.defaultGenres(library.contentType)
+            val genreScroll=HorizontalScrollView(this).apply {
+                isVerticalScrollBarEnabled=false
+                isHorizontalScrollBarEnabled=false
+                setPadding(0,dp(2),0,dp(6))
+            }
+            val genreRow=row()
+            val upTargetId=if(inlineHomeFilters()) nav[0].id else typeButtons.getValue(library.contentType).id
+            genres.forEach { gf ->
+                val selected=selectedGenreId==gf.id
+                val btn=addButton(genreRow,gf.label,selected) { switchGenre(gf.id) }.apply {
+                    textSize=13f
+                    minHeight=dp(32)
+                    setPadding(dp(11),dp(5),dp(11),dp(5))
+                    nextFocusUpId=upTargetId
+                }
+                genreButtons[gf.id]=btn
+            }
+            genreScroll.addView(genreRow)
+            container.addView(genreScroll)
+            val activeGenreBtn=genreButtons[selectedGenreId] ?: genreButtons.values.firstOrNull()
+            if(activeGenreBtn!=null) {
+                typeButtons.values.forEach { it.nextFocusDownId=activeGenreBtn.id }
+                sourceButton?.nextFocusDownId=activeGenreBtn.id
+                if(inlineHomeFilters()) nav.forEach { it.nextFocusDownId=activeGenreBtn.id }
+            }
         }
         if(tab==1) {
             val searchRow=row()
@@ -511,26 +601,37 @@ class MainActivity: Activity() {
             catalog=localItems(); ranking=null; page=page.coerceIn(1,maxOf(1,(catalog.size+pageSize-1)/pageSize)); hasMore=page*pageSize<catalog.size
         }
         if(load) {
-            if(tab==0) catalogGrid(body,focusNav,focusType,loading=true)
+            if(tab==0) catalogGrid(body,focusNav,focusType,loading=true,focusGenre=focusGenre)
             else { message(body,"正在加载…"); if(focusType) typeButtons[library.contentType]?.requestFocus() else nav[tab].requestFocus() }
             val requestTab=tab; val requestPage=page; val requestQuery=query; val requestType=library.contentType
+            val requestGenre=selectedGenreId; val requestSource=library.mediaSource
             work({
                 if(!library.deviceRegistered()) registerDeviceOnce()
-                val result=when(requestTab) { 0 -> repository.home(requestPage,requestType); 2 -> repository.comicRanking(requestPage); else -> repository.search(requestQuery,requestPage,requestType) }
+                val result=when(requestTab) {
+                    0 -> repository.home(requestPage,requestType,requestGenre,requestSource)
+                    2 -> repository.comicRanking(requestPage)
+                    else -> repository.search(requestQuery,requestPage,requestType,requestSource)
+                }
                 result
             }, { result ->
-                if(requestTab==0 && requestPage==1) library.cacheHome(requestType,result.items,result.hasMore)
-                if(requestTab==0 && requestPage==1 && (homeFromCache || tvTools.showing || updater.showing)) {
+                if(result.genres.isNotEmpty() && requestTab==0) {
+                    availableGenres=result.genres
+                }
+                if(requestTab==0 && requestPage==1 && requestGenre.isEmpty() && requestSource==MediaSource.HONGGUO) {
+                    library.cacheHome(requestType,result.items,result.hasMore)
+                }
+                if(requestTab==0 && requestPage==1 && requestGenre.isEmpty() && requestSource==MediaSource.HONGGUO && (homeFromCache || tvTools.showing || updater.showing)) {
                     homeScreen?.refresh?.text="热门已更新 · 按确认查看"
                     homeScreen?.refresh?.setOnClickListener { catalog=result.items; hasMore=result.hasMore; ranking=result.ranking; showCatalog() }
                 } else {
                     catalog=result.items; hasMore=result.hasMore; ranking=result.ranking
-                    val keepNav=nav.any { it.hasFocus() }; val keepType=typeButtons.values.any { it.hasFocus() }
+                    val keepNav=nav.any { it.hasFocus() }; val keepType=typeButtons.values.any { it.hasFocus() } || sourceButton?.hasFocus()==true
+                    val keepGenre=genreButtons.values.any { it.hasFocus() }
                     rankSubtitle?.text=ranking?.updatedText?.ifBlank { "来源：红果漫剧热播榜" } ?: "来源：红果漫剧热播榜"
-                    body.removeAllViews(); catalogGrid(body,keepNav || focusNav,keepType || focusType)
+                    body.removeAllViews(); catalogGrid(body,keepNav || focusNav,keepType || focusType,focusGenre=keepGenre || focusGenre)
                 }
             }, { problem ->
-                if(requestTab==0 && requestPage==1) {
+                if(requestTab==0 && requestPage==1 && requestGenre.isEmpty() && requestSource==MediaSource.HONGGUO) {
                     homeScreen?.refresh?.text=if(catalog.isNotEmpty()) "当前显示上次内容 · 联网后按确认刷新" else "热门暂时无法加载 · 按确认重试"
                     homeScreen?.refresh?.setOnClickListener { showCatalog(true) }
                     return@work
@@ -546,10 +647,10 @@ class MainActivity: Activity() {
                     if(resumeCards.isNotEmpty()) resumeCards.first().requestFocus()
                 }
             })
-        } else catalogGrid(body,focusNav,focusType)
+        } else catalogGrid(body,focusNav,focusType,focusGenre=focusGenre)
     }
-    private fun catalogGrid(body: LinearLayout,focusNav: Boolean,focusType: Boolean=false,loading: Boolean=false) {
-        if(tab==0 && page==1 && collection==null) { renderHome(body,focusNav,focusType,loading); return }
+    private fun catalogGrid(body: LinearLayout,focusNav: Boolean,focusType: Boolean=false,loading: Boolean=false,focusGenre: Boolean=false) {
+        if(tab==0 && page==1 && collection==null && selectedGenreId.isEmpty() && library.mediaSource==MediaSource.HONGGUO) { renderHome(body,focusNav,focusType,loading,focusGenre); return }
         resumeCards.clear(); catalogCards.clear(); cardImages.clear(); collectionBack=null
         if(collection!=null) {
             val heading=row()
@@ -561,12 +662,13 @@ class MainActivity: Activity() {
             body.addView(heading)
             typeButtons.values.forEach { it.nextFocusDownId=collectionBack!!.id }
         }
-        catalogPageKey="$tab:${collection.orEmpty()}:$page:$query"
+        catalogPageKey="$tab:${collection.orEmpty()}:${library.mediaSource.storedValue}:$selectedGenreId:$page:$query"
         val preview=SeriesPreview(this); selectionPreview=preview; body.addView(preview)
         val scroll=ScrollView(this).apply { isFillViewport=false; isVerticalScrollBarEnabled=false; clipToPadding=false }; catalogScroll=scroll
         val list=column(); scroll.addView(list); body.addView(scroll,lp(-1,0).apply { weight=1f })
         var restoringScroll=true
         val displayed=if(localCatalog()) catalog.drop((page-1)*pageSize).take(pageSize) else if(tab==0) catalog.filterNot { it.id in library.hidden() } else catalog.take(30)
+        val activeGenreView=genreButtons[selectedGenreId] ?: genreButtons.values.firstOrNull()
         if(displayed.isEmpty()) {
             message(list,if(loading) "正在加载推荐…" else when(tab) { 1 -> if(query.isBlank()) "输入关键词，用遥控器确认搜索" else "没有找到相关${library.contentType.label}，换个关键词试试"; 3 -> "在剧集详情中选择收藏，喜欢的剧就会出现在这里"; 4 -> "播放过的剧集会自动保存在这里"; else -> "本页没有更多内容" })
             if((tab<=2 || localCatalog()) && page>1) addButton(list,"上一页") { page--; showCatalog(!localCatalog()) }
@@ -575,7 +677,7 @@ class MainActivity: Activity() {
                 typeButtons.values.forEach { it.nextFocusDownId=resumeCards.first().id }
                 resumeCards.forEach { it.nextFocusDownId=it.id }
             }
-            if(focusType) typeButtons[library.contentType]?.requestFocus() else if(collectionBack!=null && !focusNav) collectionBack?.requestFocus() else if(focusNav || resumeCards.isEmpty()) nav[tab].requestFocus() else resumeCards.first().requestFocus()
+            if(focusGenre && activeGenreView!=null) activeGenreView.requestFocus() else if(focusType) typeButtons[library.contentType]?.requestFocus() else if(collectionBack!=null && !focusNav) collectionBack?.requestFocus() else if(focusNav || resumeCards.isEmpty()) nav[tab].requestFocus() else resumeCards.first().requestFocus()
             return
         }
         val cards=mutableListOf<View>(); val count=6; val gap=dp(14); val width=((resources.displayMetrics.widthPixels*.9f-gap*(count-1))/count).toInt()
@@ -635,7 +737,7 @@ class MainActivity: Activity() {
         cards.forEachIndexed { index,card ->
             card.nextFocusLeftId=if(index%count==0) card.id else cards[index-1].id
             card.nextFocusRightId=if(index%count==count-1 || index==cards.lastIndex) card.id else cards[index+1].id
-            card.nextFocusUpId=if(index<count) (searchInput?.id ?: collectionBack?.id ?: typeButtons[library.contentType]?.id ?: rankRefresh?.id ?: favoriteCheck?.id ?: historyManage?.id ?: resumeCards.getOrNull(minOf(index,2))?.id ?: nav[tab].id) else cards[index-count].id
+            card.nextFocusUpId=if(index<count) (searchInput?.id ?: collectionBack?.id ?: activeGenreView?.id ?: typeButtons[library.contentType]?.id ?: rankRefresh?.id ?: favoriteCheck?.id ?: historyManage?.id ?: resumeCards.getOrNull(minOf(index,2))?.id ?: nav[tab].id) else cards[index-count].id
             card.nextFocusDownId=if(index+count<cards.size) cards[index+count].id else if(index/count<cards.lastIndex/count) cards.last().id else next?.takeIf { it.isFocusable }?.id ?: prev?.takeIf { it.isFocusable }?.id ?: card.id
         }
         nav.forEach { it.nextFocusDownId=typeButtons[library.contentType]?.id ?: rankRefresh?.id ?: favoriteCheck?.id ?: historyManage?.id ?: cards.first().id }
@@ -643,14 +745,17 @@ class MainActivity: Activity() {
         historyManage?.nextFocusDownId=cards.first().id
         favoriteCheck?.nextFocusDownId=cards.first().id
         collectionBack?.nextFocusDownId=cards.first().id
+        genreButtons.values.forEach { it.nextFocusDownId=cards.first().id }
         resumeCards.forEachIndexed { index,v -> v.nextFocusDownId=cards[minOf(index,cards.lastIndex)].id }
         if(resumeCards.isNotEmpty()) cards.take(count).forEachIndexed { index,v -> v.nextFocusUpId=resumeCards[minOf(index,resumeCards.lastIndex)].id }
-        else homeUpdates?.let { updates -> updates.nextFocusUpId=typeButtons[library.contentType]?.id ?: nav[0].id; updates.nextFocusDownId=cards.first().id; cards.take(count).forEach { it.nextFocusUpId=updates.id } }
-        typeButtons.values.forEach { it.nextFocusDownId=searchInput?.id ?: collectionBack?.id ?: resumeCards.firstOrNull()?.id ?: homeUpdates?.id ?: cards.first().id }
+        else homeUpdates?.let { updates -> updates.nextFocusUpId=activeGenreView?.id ?: typeButtons[library.contentType]?.id ?: nav[0].id; updates.nextFocusDownId=cards.first().id; cards.take(count).forEach { it.nextFocusUpId=updates.id } }
+        val downFromType=searchInput?.id ?: collectionBack?.id ?: activeGenreView?.id ?: resumeCards.firstOrNull()?.id ?: homeUpdates?.id ?: cards.first().id
+        typeButtons.values.forEach { it.nextFocusDownId=downFromType }
+        sourceButton?.nextFocusDownId=downFromType
         searchInput?.nextFocusDownId=cards.first().id
         searchButton?.nextFocusDownId=cards[minOf(4,cards.lastIndex)].id
         searchActions.forEach { it.nextFocusDownId=cards[minOf(4,cards.lastIndex)].id }
-        if(focusType) typeButtons[library.contentType]?.requestFocus() else if(focusNav) nav[tab].requestFocus()
+        if(focusGenre && activeGenreView!=null) activeGenreView.requestFocus() else if(focusType) typeButtons[library.contentType]?.requestFocus() else if(focusNav) nav[tab].requestFocus()
         else if(resumeCards.isNotEmpty() && (catalogFocus.isEmpty() || catalogFocus.startsWith("resume:"))) (resumeCards.firstOrNull { it.tag==catalogFocus } ?: resumeCards.first()).requestFocus()
         else cards[displayed.indexOfFirst { it.id==catalogFocus }.coerceAtLeast(0)].requestFocus()
         val savedScroll=scrollPositions[catalogPageKey]
@@ -683,21 +788,30 @@ class MainActivity: Activity() {
         return listOf(if(library.favorite(series.id)) "已收藏" else "",if(library.queued(series.id)) "稍后看" else "",
             if(library.watched(series.id)) "整剧已看完" else progress?.let { "上次第 ${it.episodeIndex+1} 集 · ${formatTime(it.position)}" }.orEmpty()).filter { it.isNotBlank() }.joinToString(" · ")
     }
-    private fun renderHome(body: LinearLayout,focusNav: Boolean,focusType: Boolean,loading: Boolean) {
+    private fun renderHome(body: LinearLayout,focusNav: Boolean,focusType: Boolean,loading: Boolean,focusGenre: Boolean=false) {
         homeUpdateCount=library.updatedFavorites()
         val preview=SeriesPreview(this); selectionPreview=preview; body.addView(preview)
-        val top=if(inlineHomeFilters()) nav[0] else typeButtons.getValue(library.contentType)
+        val activeGenreView=genreButtons[selectedGenreId] ?: genreButtons.values.firstOrNull()
+        val top=activeGenreView ?: if(inlineHomeFilters()) nav[0] else typeButtons.getValue(library.contentType)
         val home=HomeScreen(this,top,::loadCover,{ item,label -> preview.show(item,if(label.startsWith("第 ")) selectionStatus(item) else listOf(label,selectionStatus(item)).filter { it.isNotBlank() }.joinToString(" · ")) },
             { item,resume -> openDetail(item,resume) },::quickActions,{ catalogFocus=it })
         homeScreen=home; body.addView(home,lp(-1,0).apply { weight=1f })
         val hot=catalog.filterNot { it.id in library.hidden() }
-        home.render(homeShelves(),catalogFocus,!focusNav && !focusType,
+        home.render(homeShelves(),catalogFocus,!focusNav && !focusType && !focusGenre,
             if(hasMore) { { page=2; catalogFocus=""; showCatalog(true) } } else null,homePosition)
         home.refresh.text=if(loading) if(homeFromCache) "已显示上次内容 · 正在更新热门…" else "正在更新热门…" else "刷新热门"
         home.refresh.setOnClickListener { showCatalog(true) }
-        typeButtons.values.forEach { it.nextFocusDownId=home.firstId() }
-        if(inlineHomeFilters()) nav.forEach { it.nextFocusDownId=home.firstId() }
-        if(focusNav) nav[0].requestFocus() else if(focusType) typeButtons.getValue(library.contentType).requestFocus()
+        if(activeGenreView!=null) {
+            genreButtons.values.forEach { it.nextFocusDownId=home.firstId() }
+            typeButtons.values.forEach { it.nextFocusDownId=activeGenreView.id }
+            sourceButton?.nextFocusDownId=activeGenreView.id
+            if(inlineHomeFilters()) nav.forEach { it.nextFocusDownId=activeGenreView.id }
+        } else {
+            typeButtons.values.forEach { it.nextFocusDownId=home.firstId() }
+            sourceButton?.nextFocusDownId=home.firstId()
+            if(inlineHomeFilters()) nav.forEach { it.nextFocusDownId=home.firstId() }
+        }
+        if(focusGenre && activeGenreView!=null) activeGenreView.requestFocus() else if(focusNav) nav[0].requestFocus() else if(focusType) typeButtons.getValue(library.contentType).requestFocus()
         if(hot.isNotEmpty() && !homeContentLogged) {
             homeContentLogged=true
             body.post { android.util.Log.i("HongguoTV","Home content ready cached=$homeFromCache elapsedMs=${android.os.SystemClock.elapsedRealtime()-activityStarted}") }
@@ -821,6 +935,15 @@ class MainActivity: Activity() {
             library.seamlessNext=!library.seamlessNext
             seamlessNextButton.text="无缝换集  ·  ${if(library.seamlessNext) "开启" else "关闭"}"
         }
+        lateinit var danmakuButton: TextView
+        danmakuButton=setting(playback,"时间轴弹幕  ·  ${if(library.danmakuEnabled) "开启" else "关闭"}") {
+            library.danmakuEnabled=!library.danmakuEnabled
+            danmakuButton.text="时间轴弹幕  ·  ${if(library.danmakuEnabled) "开启" else "关闭"}"
+        }
+        lateinit var sourceSettingButton: TextView
+        sourceSettingButton=setting(playback,"默认片源平台  ·  ${library.mediaSource.label}") {
+            showSourcePicker(sourceSettingButton, true)
+        }
         lateinit var updates: TextView
         updates=setting(device,settingsUpdateLabel()) { updater.show(updates) }
         settingsUpdateButton=updates
@@ -842,7 +965,7 @@ class MainActivity: Activity() {
         val license=setting(device,"开源许可") {
             AlertDialog.Builder(this).setTitle("开源许可").setMessage("本原生版以 GPL-3.0 发布。\n内容协议与加密处理移植自 drpys（22261ad）。\nAndroidX Media3 / OkHttp：Apache-2.0\nKotlin：Apache-2.0\nBouncy Castle：MIT\n完整源码和许可证见 GitHub：Lxontw/hongguoTV。").setPositiveButton("关闭",null).show()
         }
-        val left=listOf(qualityButton,defaultSpeed,frame,autoNextButton,seamlessNextButton); val right=listOf(updates,backup,hidden,license)
+        val left=listOf(qualityButton,defaultSpeed,frame,autoNextButton,seamlessNextButton,danmakuButton,sourceSettingButton); val right=listOf(updates,backup,hidden,license)
         listOf(left,right).forEach { items -> items.forEachIndexed { index,view ->
             view.nextFocusUpId=items.getOrNull(index-1)?.id ?: nav[tab].id
             view.nextFocusDownId=items.getOrNull(index+1)?.id ?: view.id
@@ -1044,6 +1167,7 @@ class MainActivity: Activity() {
         saveProgress(); library.flush(); invalidatePage(); favoriteMonitor.stop(); releaseCatalogViews()
         if(reuse) {
             cancelRecovery(); cancelPrefetch(); clearQueuedMedia(); tvTools.close()
+            danmakuJob?.cancel(true); danmakuJob=null; danmakuOverlay?.clearTimeline()
             episodePanel?.dismiss(); episodePanel=null; speedDialog?.dismiss(); speedDialog=null
             playerListener?.let { player?.removeListener(it) }; playerListener=null
             player?.stop(); player?.clearMediaItems()
@@ -1069,6 +1193,9 @@ class MainActivity: Activity() {
                 setShowBuffering(if(library.seamlessNext) PlayerView.SHOW_BUFFERING_NEVER else PlayerView.SHOW_BUFFERING_ALWAYS)
             }
             playerView=view; root.addView(view,FrameLayout.LayoutParams(-1,-1))
+            val dm=DanmakuOverlayView(this).apply { setDanmakuEnabled(library.danmakuEnabled) }
+            danmakuOverlay=dm
+            root.addView(dm,FrameLayout.LayoutParams(-1,(resources.displayMetrics.heightPixels*0.28f).toInt(),Gravity.TOP))
             hud=column().apply { setPadding(dp(widthDp()*.05f),dp(20),dp(widthDp()*.05f),(resources.displayMetrics.heightPixels*.05f).toInt()); background=GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM,intArrayOf(Color.TRANSPARENT,Color.argb(240,11,15,21))) }
             playbackTitle=text("",23f).apply { maxLines=1; ellipsize=TextUtils.TruncateAt.END; setTypeface(null,Typeface.BOLD) }; hud.addView(playbackTitle)
             playbackText=text("",15f,muted).apply { setPadding(0,dp(10),0,dp(9)) }; hud.addView(playbackText)
@@ -1078,12 +1205,15 @@ class MainActivity: Activity() {
             root.addView(ScrollView(this).apply { isVerticalScrollBarEnabled=false; addView(hud) },FrameLayout.LayoutParams(-1,-2,Gravity.BOTTOM))
         } else {
             playerView?.setShowBuffering(if(library.seamlessNext) PlayerView.SHOW_BUFFERING_NEVER else PlayerView.SHOW_BUFFERING_ALWAYS)
+            danmakuOverlay?.setDanmakuEnabled(library.danmakuEnabled)
         }
+        main.removeCallbacks(danmakuTick); main.post(danmakuTick)
         playbackTitle.text="${data.series.title}  ·  第 ${episodeIndex+1} 集"
         playbackText.text="正在获取播放地址…"; progressBar.progress=0; progressBar.visibility=View.VISIBLE; hidePlaybackOverlay()
         controls.removeAllViews(); controls.visibility=View.GONE; transportPlay=null; sleepButton=null
         syncMediaSession()
         val requestedId=data.episodes[episodeIndex]; val maxQuality=library.maxQuality; val ticket=generation
+        requestDanmakuForEpisode(requestedId, position.coerceAtLeast(0), ticket)
         work({
             if (prefetched != null) {
                 android.util.Log.i("HongguoTV","playEpisode using prefetched stream for episode=${episodeIndex+1} id=$requestedId")
@@ -1147,6 +1277,8 @@ class MainActivity: Activity() {
                         readySince=android.os.SystemClock.elapsedRealtime()
                         firstReady=false
                         firstFrame=true
+                        danmakuOverlay?.clearTimeline()
+                        requestDanmakuForEpisode(currentMediaId, 0L, ticket)
                     }
                 }
                 override fun onPlaybackStateChanged(state: Int) {
@@ -1402,15 +1534,35 @@ class MainActivity: Activity() {
             lateinit var seasonBtn: TextView
             seasonBtn=addButton(options,"选季（共 ${detailSeasons.size} 季）") { showSeasonPicker(seasonBtn) }
         }
+        lateinit var dmBtn: TextView
+        dmBtn=addButton(options,"弹幕：${if(library.danmakuEnabled) "开" else "关"}",library.danmakuEnabled) {
+            library.danmakuEnabled=!library.danmakuEnabled
+            dmBtn.text="弹幕：${if(library.danmakuEnabled) "开" else "关"}"
+            danmakuOverlay?.setDanmakuEnabled(library.danmakuEnabled)
+            if(library.danmakuEnabled) {
+                val epId=detail?.episodes?.getOrNull(episodeIndex).orEmpty()
+                if(epId.isNotEmpty()) requestDanmakuForEpisode(epId, currentPosition(), generation)
+            }
+            Toast.makeText(this,"弹幕已${if(library.danmakuEnabled) "开启" else "关闭"}",Toast.LENGTH_SHORT).show()
+        }
         lateinit var more: TextView
         more=addButton(options,"播放设置") {
-            tvTools.choose("播放设置",listOf("倍速 ${PlaybackSpeed.label(library.playbackSpeed)}","清晰度 ${library.maxQuality}P","画面 ${library.frameMode.label}","无缝换集 ${if(library.seamlessNext) "开启" else "关闭"}","定时 ${sleepTimer.label()}","从头播放"),more,{ choice ->
+            tvTools.choose("播放设置",listOf("倍速 ${PlaybackSpeed.label(library.playbackSpeed)}","清晰度 ${library.maxQuality}P","画面 ${library.frameMode.label}","弹幕 ${if(library.danmakuEnabled) "开启" else "关闭"}","无缝换集 ${if(library.seamlessNext) "开启" else "关闭"}","定时 ${sleepTimer.label()}","从头播放"),more,{ choice ->
                 main.post {
                     if(screen=="player" && more.isAttachedToWindow) when(choice) {
                         0 -> showSpeedPicker(more)
                         1 -> showQualityPicker(more,true)
                         2 -> showFramePicker(more,true)
                         3 -> {
+                            library.danmakuEnabled=!library.danmakuEnabled
+                            danmakuOverlay?.setDanmakuEnabled(library.danmakuEnabled)
+                            if(library.danmakuEnabled) {
+                                val epId=detail?.episodes?.getOrNull(episodeIndex).orEmpty()
+                                if(epId.isNotEmpty()) requestDanmakuForEpisode(epId, currentPosition(), generation)
+                            }
+                            Toast.makeText(this,"弹幕已${if(library.danmakuEnabled) "开启" else "关闭"}",Toast.LENGTH_SHORT).show()
+                        }
+                        4 -> {
                             library.seamlessNext=!library.seamlessNext
                             playerView?.setShowBuffering(if(library.seamlessNext) PlayerView.SHOW_BUFFERING_NEVER else PlayerView.SHOW_BUFFERING_ALWAYS)
                             if(!library.seamlessNext) {
@@ -1421,8 +1573,8 @@ class MainActivity: Activity() {
                             }
                             Toast.makeText(this,"无缝换集已${if(library.seamlessNext) "开启" else "关闭"}",Toast.LENGTH_SHORT).show()
                         }
-                        4 -> showSleepPicker(more)
-                        5 -> { seekTo(0); hidePanel() }
+                        5 -> showSleepPicker(more)
+                        6 -> { seekTo(0); hidePanel() }
                     }
                 }
             })
@@ -1515,8 +1667,25 @@ class MainActivity: Activity() {
         val p=player ?: return; val data=detail ?: return; if(!playbackReady || episodeIndex !in data.episodes.indices) return
         library.save(WatchProgress(data.series,data.episodes[episodeIndex],episodeIndex,p.currentPosition.coerceAtLeast(0),p.duration.coerceAtLeast(0),completed || p.playbackState==Player.STATE_ENDED,System.currentTimeMillis()))
     }
+    private fun requestDanmakuForEpisode(videoId: String, initialPositionMs: Long, ticket: Int) {
+        danmakuJob?.cancel(true)
+        danmakuJob = null
+        if (!library.danmakuEnabled) return
+        danmakuJob = danmakuWorker.submit {
+            val items = runCatching { repository.danmaku(videoId) }.getOrDefault(emptyList())
+            main.post {
+                if (!isDestroyed && generation == ticket && screen == "player" && library.danmakuEnabled) {
+                    danmakuOverlay?.loadTimeline(items, currentPosition().coerceAtLeast(initialPositionMs))
+                }
+            }
+        }
+    }
+
     private fun releasePlayer() {
         cancelRecovery(); cancelPrefetch(); clearQueuedMedia(); mediaSession.deactivate(); tvTools.close()
+        danmakuJob?.cancel(true); danmakuJob=null
+        main.removeCallbacks(danmakuTick)
+        danmakuOverlay?.clearTimeline(); danmakuOverlay=null
         val wasForeground=foreground; foreground=false
         val oldPanel=episodePanel; episodePanel=null; oldPanel?.dismiss(); foreground=wasForeground
         speedDialog?.dismiss(); speedDialog=null
@@ -1622,7 +1791,7 @@ class MainActivity: Activity() {
         if(networkRegistered) connectivity.unregisterNetworkCallback(networkCallback)
         favoriteMonitor.destroy(); tvTools.destroy(); updater.destroy(); saveProgress(); releasePlayer(); library.close()
         artwork.close(); releaseCatalogViews(); mediaSession.release(); main.removeCallbacksAndMessages(null)
-        io.shutdownNow(); prefetchWorker.shutdownNow(); networkCleanup.shutdown()
+        io.shutdownNow(); prefetchWorker.shutdownNow(); danmakuWorker.shutdownNow(); networkCleanup.shutdown()
         Thread({ repository.http.dispatcher.cancelAll(); repository.http.connectionPool.evictAll(); repository.http.dispatcher.executorService.shutdown() },"hongguotv-network-cleanup").start()
         super.onDestroy()
     }

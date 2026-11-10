@@ -449,7 +449,7 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
                     val data = JSONObject(response)
                     val code = data.optInt("Code", data.optInt("code", 0))
                     if (code != 0) throw IOException("播放接口暂不可用（${code}）")
-                    videoModelOf(data) ?: throw IOException("播放接口暂不可用（没有播放模型）")
+                    videoModelOf(data, id) ?: throw IOException("播放接口暂不可用（没有播放模型）")
                 }
                 val model = attempt.getOrNull()
                 if (model != null) return model
@@ -468,6 +468,16 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
                 }
             }
         }
+        for (host in listOf("https://api5-normal-sinfonlineb.fqnovel.com", "https://api5-normal-lf.fqnovel.com")) {
+            val tabAttempt = runCatching { tabVideoModel(host, id) }
+            val model = tabAttempt.getOrNull()
+            if (model != null) return model
+            val ex = tabAttempt.exceptionOrNull()
+            System.err.println("ContentRepository.tabVideoModel candidate $host failed: ${ex?.javaClass?.name}: ${ex?.message}")
+            if (failure == null) {
+                failure = ex as? IOException ?: IOException(ex?.message ?: "播放接口暂不可用", ex)
+            }
+        }
         if (allowReRegister) {
             System.err.println("ContentRepository.videoModel all candidates failed, attempting registerDevice refresh...")
             val refreshed = registerDevice()
@@ -478,10 +488,44 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
         throw failure ?: IOException("播放接口暂不可用")
     }
 
-    private fun videoModelOf(data: JSONObject): JSONObject? {
+    private fun tabVideoModel(host: String, id: String): JSONObject {
+        val values = LinkedHashMap(deviceProfile()).apply {
+            for (key in listOf("version_code", "manifest_version_code", "update_version_code", "pv_player")) {
+                put(key, "73932")
+            }
+            put("version_name", "7.3.9.32")
+            put("video_id", id)
+            put("video_id_type", "0")
+            put("device_level", "1")
+            put("need_all_video_definition", "1")
+            put("need_mp4_align", "0")
+            put("use_os_player", "0")
+            put("video_platform", "1024")
+            put("source", "0")
+            put("from_video_id", "")
+        }
+        val signed = signer.sign("$host/reading/bookapi/video_tab/multi_video_model/v1/", values)
+        val ua = VendorConstants.VIDEO_UA.replace("71332", "73932")
+        val request = signed.copy(headers = LinkedHashMap(signed.headers).apply { put("User-Agent", ua) })
+        val response = text(request.url, request)
+        if (response.isBlank()) throw IOException("播放接口暂不可用（空响应）")
+        val data = JSONObject(response)
+        val code = data.optInt("Code", data.optInt("code", 0))
+        if (code != 0) throw IOException("播放接口暂不可用（${code}）")
+        return videoModelOf(data, id) ?: throw IOException("播放接口暂不可用（没有播放模型）")
+    }
+
+    private fun videoModelOf(data: JSONObject, expectedId: String = ""): JSONObject? {
         val root = data.optJSONObject("data") ?: return null
         model(root.opt("video_model"))?.let { return it }
-        val entry = root.keys().asSequence().mapNotNull { root.optJSONObject(it) }.firstOrNull() ?: return null
+        val container = root.optJSONObject("video_model_data") ?: root
+        if (expectedId.isNotEmpty()) {
+            container.optJSONObject(expectedId)?.let { entry ->
+                model(entry.opt("video_model"))?.let { return it }
+            }
+            if (root.has("video_model_data")) return null
+        }
+        val entry = container.keys().asSequence().mapNotNull { container.optJSONObject(it) }.firstOrNull() ?: return null
         return model(entry.opt("video_model"))
     }
 
@@ -491,19 +535,37 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
         else -> null
     }
 
-    private fun fallbackApiCandidates(fallback: String): List<String> {
+    private fun stripFallbackLockoutParams(url: String): String {
+        return url
+            .replace(Regex("([?&])force_fids=[^&]*&?"), "$1")
+            .replace(Regex("([?&])encode_user_tag=[^&]*&?"), "$1")
+            .replace("?&", "?")
+            .replace("&&", "&")
+            .trimEnd('&', '?')
+    }
+
+    internal fun fallbackApiCandidates(fallback: String): List<String> {
         val urls = linkedSetOf<String>()
-        val codecRegex = Regex("([?&]codec_type=)(?:4|2)\\b")
-        if (codecRegex.containsMatchIn(fallback)) {
-            urls += codecRegex.replace(fallback, "$13")
-            urls += codecRegex.replace(fallback, "$11")
+        val stripped = stripFallbackLockoutParams(fallback)
+        val anyCodecRegex = Regex("([?&]codec_type=)[0-9]+\\b")
+        val incompatibleCodecRegex = Regex("([?&]codec_type=)(?:4|2)\\b")
+        if (stripped != fallback && anyCodecRegex.containsMatchIn(stripped)) {
+            urls += anyCodecRegex.replace(stripped, "$10")
+            urls += anyCodecRegex.replace(stripped, "$13")
+            urls += anyCodecRegex.replace(stripped, "$11")
+            urls += stripped
+        }
+        if (incompatibleCodecRegex.containsMatchIn(fallback)) {
+            urls += incompatibleCodecRegex.replace(fallback, "$13")
+            urls += incompatibleCodecRegex.replace(fallback, "$11")
+            urls += incompatibleCodecRegex.replace(fallback, "$10")
             urls += fallback
         } else {
             urls += fallback
-            val anyCodecRegex = Regex("([?&]codec_type=)[0-9]+\\b")
             if (anyCodecRegex.containsMatchIn(fallback)) {
                 urls += anyCodecRegex.replace(fallback, "$13")
                 urls += anyCodecRegex.replace(fallback, "$11")
+                urls += anyCodecRegex.replace(fallback, "$10")
             }
         }
         return urls.toList()
@@ -518,16 +580,20 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
 
     private fun parseModelStreams(model: JSONObject, maxQuality: Int): StreamInfo? {
         var hasIncompatible = false
-        val list = model.optJSONArray("video_list")
-        if (list != null && list.length() > 0) {
+        val rawVideoList = model.opt("video_list")
+        val inlineObjects: List<JSONObject> = when (rawVideoList) {
+            is JSONArray -> rawVideoList.objects()
+            is JSONObject -> rawVideoList.keys().asSequence().mapNotNull { rawVideoList.optJSONObject(it) }.toList()
+            else -> emptyList()
+        }
+        if (inlineObjects.isNotEmpty()) {
             data class PreloadRow(val quality: Int, val codecRank: Int, val url: String, val spadeA: String, val width: Int = 0, val height: Int = 0)
             val rows = mutableListOf<PreloadRow>()
-            for (i in 0 until list.length()) {
-                val v = list.optJSONObject(i) ?: continue
+            for (v in inlineObjects) {
                 val mainUrl = cleanUrl(v.str("main_url"))
                 if (mainUrl.isEmpty() || (!mainUrl.startsWith("http://") && !mainUrl.startsWith("https://"))) continue
-                val meta = v.optJSONObject("video_meta")
-                val codec = meta?.str("codec_type")?.lowercase().orEmpty()
+                val meta = v.optJSONObject("video_meta") ?: v
+                val codec = meta.str("codec_type").ifEmpty { v.str("codec_type") }.lowercase()
                 if (codec in setOf("bytevc2", "bvc2")) {
                     hasIncompatible = true
                     continue
@@ -540,9 +606,13 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
                 if (spadeA.isEmpty() && !explicitlyUnencrypted && model.has("fallback_api")) {
                     continue
                 }
-                val height = meta?.optInt("vheight", 0) ?: 0
-                val width = meta?.optInt("vwidth", 0) ?: 0
-                val defStr = meta?.str("definition")?.ifEmpty { meta.str("quality") }.orEmpty()
+                val height = meta.optInt("vheight", v.optInt("vheight", 0))
+                val width = meta.optInt("vwidth", v.optInt("vwidth", 0))
+                val defStr = meta.str("definition")
+                    .ifEmpty { meta.str("quality_desc") }
+                    .ifEmpty { meta.str("quality") }
+                    .ifEmpty { v.str("quality_desc") }
+                    .ifEmpty { v.str("definition") }
                 val qNum = if (height > 0) height else qualityNumber(defStr)
                 rows += PreloadRow(qNum, codecRank(codec), mainUrl, spadeA, width, height)
             }
@@ -624,26 +694,40 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
         throw IOException("未找到可播放的视频流")
     }
 
-    fun danmaku(videoId: String): List<DanmakuItem> {
+    fun danmaku(videoId: String, seriesId: String = ""): List<DanmakuItem> {
         if (!videoId.matches(Regex("[0-9]{1,30}"))) return emptyList()
+        val bookId = seriesId.trim().takeIf { it.matches(Regex("[0-9]{1,30}")) } ?: videoId
         return runCatching {
             val rawItems = mutableListOf<DanmakuRaw>()
-            var offset = 0
-            val host = "https://api5-normal-sinfonlinea.fqnovel.com"
+            var startMs = 0L
+            var durationMs = DanmakuRepository.EFFECTIVE_DURATION_MS
+            var emptyPages = 0
+            val profile = deviceProfile()
+            val devId = profile["device_id"].orEmpty()
+            val iid = profile["iid"].orEmpty()
             for (pageIdx in 0 until DanmakuRepository.MAX_PAGES) {
-                val values = LinkedHashMap(deviceProfile()).apply {
-                    put("offset", offset.toString())
-                    put("count", "30")
-                    put("sort_type", "1")
-                }
-                val signed = signer.sign("$host/novel/commentapi/comment/list/$videoId/v1/", values)
+                val signed = DanmakuRepository.buildSignedCommentRequest(
+                    vid = videoId,
+                    bookId = bookId,
+                    startMs = startMs,
+                    durationMs = durationMs,
+                    deviceId = devId,
+                    installId = iid,
+                    stampMs = clock()
+                )
                 val rawText = text(signed.url, signed)
-                val (pageItems, hasMore, nextOffset) = DanmakuRepository.parsePage(rawText)
-                rawItems += pageItems
-                if (!hasMore) break
-                val next = nextOffset ?: (offset + 30)
-                if (next <= offset) break
-                offset = next
+                val (pageItems, hasMore, nextOffset) = DanmakuRepository.parsePage(rawText, videoId)
+                if (pageItems.isNotEmpty()) {
+                    rawItems += pageItems
+                    emptyPages = 0
+                } else {
+                    emptyPages++
+                }
+                if (rawItems.size >= DanmakuRepository.MAX_ITEMS_PER_EPISODE || !hasMore || emptyPages >= 2) break
+                val next = nextOffset?.toLong() ?: break
+                if (next <= startMs || next > DanmakuRepository.MAX_OFFSET_MS) break
+                startMs = next
+                durationMs = minOf(maxOf(durationMs, startMs + DanmakuRepository.EFFECTIVE_DURATION_MS), DanmakuRepository.MAX_DURATION_MS)
             }
             DanmakuRepository.mergeAndSort(rawItems)
         }.getOrDefault(emptyList())

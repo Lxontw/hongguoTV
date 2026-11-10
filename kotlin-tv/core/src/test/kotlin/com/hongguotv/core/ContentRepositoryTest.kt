@@ -5,6 +5,8 @@ import okhttp3.Protocol
 import okhttp3.Request
 import okhttp3.Response
 import okhttp3.ResponseBody.Companion.toResponseBody
+import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.MediaType.Companion.toMediaType
 import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.*
@@ -346,6 +348,61 @@ class ContentRepositoryTest {
         val problem=assertThrows(IOException::class.java) { repo.search("修仙",1,ContentType.COMIC) }
         assertFalse(problem is org.json.JSONException)
         assertEquals("搜索接口暂不可用",problem.message)
+    }
+
+    @Test fun fallbackApiCandidatesStripsForceFidsAndEncodeUserTagLockoutParams() {
+        val repo = ContentRepository()
+        val raw = "https://vas-lf-x.snssdk.com/video/fplay/1/abc/v02d0fg10004dblb1ti7dld1u0irj1o0?aid=8662&codec_type=4&device_id=123&encode_user_tag=only_roi_vcube_improve_1&force_fids=NDYzOTsyMmQx&format_type=mp4&ssl=1"
+        val candidates = repo.fallbackApiCandidates(raw)
+        assertTrue(candidates.isNotEmpty())
+        assertEquals(
+            "https://vas-lf-x.snssdk.com/video/fplay/1/abc/v02d0fg10004dblb1ti7dld1u0irj1o0?aid=8662&codec_type=0&device_id=123&format_type=mp4&ssl=1",
+            candidates[0]
+        )
+        assertEquals(
+            "https://vas-lf-x.snssdk.com/video/fplay/1/abc/v02d0fg10004dblb1ti7dld1u0irj1o0?aid=8662&codec_type=3&device_id=123&format_type=mp4&ssl=1",
+            candidates[1]
+        )
+        assertFalse(candidates[0].contains("force_fids"))
+        assertFalse(candidates[0].contains("encode_user_tag"))
+    }
+
+    @Test fun emptyPostPlaybackRecoversViaSignedVideoTabMultiVideoModel() {
+        val requests = mutableListOf<Request>()
+        val repo = repository { request ->
+            requests += request
+            if (request.method == "POST") {
+                ""
+            } else {
+                assertEquals("/reading/bookapi/video_tab/multi_video_model/v1/", request.url.encodedPath)
+                assertEquals("73932", request.url.queryParameter("version_code"))
+                assertEquals("7.3.9.32", request.url.queryParameter("version_name"))
+                assertEquals("7700946421087751193", request.url.queryParameter("video_id"))
+                JSONObject().put("code", 0).put("data", JSONObject().put(
+                    "video_model_data", JSONObject().put(
+                        "7700946421087751193", JSONObject().put(
+                            "video_model", JSONObject()
+                                .put("video_id", "vid-770")
+                                .put("video_duration", 60.0)
+                                .put("video_list", JSONObject().put(
+                                    "hd", JSONObject()
+                                        .put("codec_type", "h264")
+                                        .put("vwidth", 1080)
+                                        .put("vheight", 1920)
+                                        .put("quality_desc", "1080p")
+                                        .put("main_url", "https://qznovelvod.com/synthetic-tab.mp4")
+                                        .put("encrypt_info", JSONObject().put("encrypt", false))
+                                ))
+                        )
+                    )
+                )).toString()
+            }
+        }
+        val stream = repo.stream("7700946421087751193", 1080)
+        assertEquals("https://qznovelvod.com/synthetic-tab.mp4", stream.url)
+        assertEquals("1920P（兼容资源）", stream.quality)
+        assertEquals(1080, stream.width)
+        assertEquals(1920, stream.height)
     }
 
     @Test fun appCategoryCatalogExtractsThemesNewTodayBadgeAndCursor() {

@@ -1541,9 +1541,10 @@ class MainActivity: Activity() {
             danmakuOverlay?.setDanmakuEnabled(library.danmakuEnabled)
             if(library.danmakuEnabled) {
                 val epId=detail?.episodes?.getOrNull(episodeIndex).orEmpty()
-                if(epId.isNotEmpty()) requestDanmakuForEpisode(epId, currentPosition(), generation)
+                if(epId.isNotEmpty()) requestDanmakuForEpisode(epId, currentPosition(), generation, notifyResult = true)
+            } else {
+                Toast.makeText(this,"弹幕已关闭",Toast.LENGTH_SHORT).show()
             }
-            Toast.makeText(this,"弹幕已${if(library.danmakuEnabled) "开启" else "关闭"}",Toast.LENGTH_SHORT).show()
         }
         lateinit var more: TextView
         more=addButton(options,"播放设置") {
@@ -1558,9 +1559,10 @@ class MainActivity: Activity() {
                             danmakuOverlay?.setDanmakuEnabled(library.danmakuEnabled)
                             if(library.danmakuEnabled) {
                                 val epId=detail?.episodes?.getOrNull(episodeIndex).orEmpty()
-                                if(epId.isNotEmpty()) requestDanmakuForEpisode(epId, currentPosition(), generation)
+                                if(epId.isNotEmpty()) requestDanmakuForEpisode(epId, currentPosition(), generation, notifyResult = true)
+                            } else {
+                                Toast.makeText(this,"弹幕已关闭",Toast.LENGTH_SHORT).show()
                             }
-                            Toast.makeText(this,"弹幕已${if(library.danmakuEnabled) "开启" else "关闭"}",Toast.LENGTH_SHORT).show()
                         }
                         4 -> {
                             library.seamlessNext=!library.seamlessNext
@@ -1667,15 +1669,22 @@ class MainActivity: Activity() {
         val p=player ?: return; val data=detail ?: return; if(!playbackReady || episodeIndex !in data.episodes.indices) return
         library.save(WatchProgress(data.series,data.episodes[episodeIndex],episodeIndex,p.currentPosition.coerceAtLeast(0),p.duration.coerceAtLeast(0),completed || p.playbackState==Player.STATE_ENDED,System.currentTimeMillis()))
     }
-    private fun requestDanmakuForEpisode(videoId: String, initialPositionMs: Long, ticket: Int) {
+    private fun requestDanmakuForEpisode(videoId: String, initialPositionMs: Long, ticket: Int, notifyResult: Boolean = false) {
         danmakuJob?.cancel(true)
         danmakuJob = null
         if (!library.danmakuEnabled) return
+        val seriesId = detail?.series?.id.orEmpty()
         danmakuJob = danmakuWorker.submit {
-            val items = runCatching { repository.danmaku(videoId) }.getOrDefault(emptyList())
+            val items = runCatching { repository.danmaku(videoId, seriesId) }.getOrDefault(emptyList())
             main.post {
                 if (!isDestroyed && generation == ticket && screen == "player" && library.danmakuEnabled) {
-                    danmakuOverlay?.loadTimeline(items, currentPosition().coerceAtLeast(initialPositionMs))
+                    val pos = currentPosition().coerceAtLeast(initialPositionMs)
+                    danmakuOverlay?.loadTimeline(items, pos)
+                    danmakuOverlay?.syncPlayback(pos, player?.isPlaying == true)
+                    if (notifyResult) {
+                        val msg = if (items.isNotEmpty()) "弹幕已开启（本集已加载 ${items.size} 条）" else "弹幕已开启（本集暂无弹幕）"
+                        Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
+                    }
                 }
             }
         }

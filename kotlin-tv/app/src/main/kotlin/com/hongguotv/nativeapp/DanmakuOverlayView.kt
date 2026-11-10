@@ -94,6 +94,10 @@ class DanmakuOverlayView(context: Context) : View(context) {
             }
         }
         cursorIndex = lo
+        // If user just loaded/enabled danmaku, step back slightly so comments near current position can appear immediately
+        while (cursorIndex > 0 && positionMs - timeline[cursorIndex - 1].offsetMs in 0..2000L) {
+            cursorIndex--
+        }
     }
 
     fun syncPlayback(positionMs: Long, isPlaying: Boolean) {
@@ -108,8 +112,8 @@ class DanmakuOverlayView(context: Context) : View(context) {
         val wasPlaying = isPlayingFlag
         isPlayingFlag = isPlaying
         if (enabledFlag && timeline.isNotEmpty()) {
-            spawnDueItems(lastPositionMs)
-            if (isPlaying && !wasPlaying) {
+            val spawned = spawnDueItems(lastPositionMs)
+            if ((isPlaying && !wasPlaying) || spawned > 0) {
                 lastFrameUptimeMs = SystemClock.uptimeMillis()
                 postInvalidateOnAnimation()
             } else if (active.isNotEmpty()) {
@@ -118,10 +122,11 @@ class DanmakuOverlayView(context: Context) : View(context) {
         }
     }
 
-    private fun spawnDueItems(positionMs: Long) {
+    private fun spawnDueItems(positionMs: Long): Int {
         val w = width.toFloat()
-        if (w <= 0f) return
+        if (w <= 0f) return 0
         val minGap = 36f * density
+        var spawned = 0
         while (cursorIndex < timeline.size) {
             val candidate = timeline[cursorIndex]
             if (candidate.offsetMs > positionMs) break
@@ -137,11 +142,13 @@ class DanmakuOverlayView(context: Context) : View(context) {
                     isRepeated = candidate.count > 1,
                     lane = lane,
                     textWidth = tw,
-                    x = w + 12f * density,
+                    x = if (isPlayingFlag) w + 12f * density else (w - tw - (spawned * 48f * density) - 32f * density).coerceAtLeast(24f * density),
                     speedPxPerSec = speed
                 )
             )
+            spawned++
         }
+        return spawned
     }
 
     private fun findAvailableLane(viewWidth: Float, minGap: Float): Int? {

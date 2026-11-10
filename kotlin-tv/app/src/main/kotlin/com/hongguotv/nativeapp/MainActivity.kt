@@ -62,11 +62,15 @@ class MainActivity: Activity() {
                 if (repository.deviceIdentity.isEmpty()) {
                     repository.deviceIdentity = library.deviceIdentity()
                 }
+                if (repository.registrationCookies.isEmpty()) {
+                    repository.registrationCookies = library.deviceCookies()
+                }
                 return true
             }
             val registered = runCatching { repository.registerDevice() }.getOrNull() ?: return false
-            library.saveDeviceIdentity(registered.deviceId, registered.installId)
+            library.saveDeviceIdentity(registered.deviceId, registered.installId, registered.cookies)
             repository.deviceIdentity = library.deviceIdentity()
+            repository.registrationCookies = library.deviceCookies()
             return true
         }
     }
@@ -259,8 +263,9 @@ class MainActivity: Activity() {
             if(!isDestroyed) { libraryLoadError=problem; if(foreground) showLibraryError(problem) }
         }) {
             repository.deviceIdentity=library.deviceIdentity()
+            repository.registrationCookies=library.deviceCookies()
             repository.onDeviceRegistered = { registered ->
-                library.saveDeviceIdentity(registered.deviceId, registered.installId)
+                library.saveDeviceIdentity(registered.deviceId, registered.installId, registered.cookies)
             }
             ensureDeviceRegistered()
             if(!isDestroyed && foreground) {
@@ -1086,12 +1091,7 @@ class MainActivity: Activity() {
             } else {
                 if(!library.deviceRegistered()) registerDeviceOnce()
                 android.util.Log.i("HongguoTV","playEpisode work starting for episode=${episodeIndex+1} id=$requestedId")
-                var streamInfo = runCatching { repository.stream(requestedId, maxQuality) }.getOrNull()
-                if (streamInfo == null) {
-                    android.util.Log.w("HongguoTV","Initial stream acquire failed, attempting re-registering device...")
-                    registerDeviceOnce(force = true)
-                    streamInfo = repository.stream(requestedId, maxQuality)
-                }
+                val streamInfo = repository.stream(requestedId, maxQuality)
                 android.util.Log.i("HongguoTV","playEpisode stream acquired: url=${streamInfo.url} quality=${streamInfo.quality}")
                 val remote = RemoteVideo(repository.http, streamInfo).prepare()
                 android.util.Log.i("HongguoTV","playEpisode remote prepared: total=${remote.total}")
@@ -1241,7 +1241,7 @@ class MainActivity: Activity() {
         source.inheritDevice(repository)
         source.onDeviceRegistered = { registered ->
             repository.inheritDevice(source)
-            library.saveDeviceIdentity(registered.deviceId, registered.installId)
+            library.saveDeviceIdentity(registered.deviceId, registered.installId, registered.cookies)
         }
         val scope=RequestScope(); prefetchScope=scope
         prefetchJob=prefetchWorker.submit {
@@ -1278,9 +1278,10 @@ class MainActivity: Activity() {
         retryPosition=currentPosition().coerceAtLeast(0); retryAutoplay=requestedAutoplay && !sleepStopped
         saveProgress(); cancelRecovery(); cancelPrefetch(); clearQueuedMedia()
         playError=true; player?.pause(); progressBar.visibility=View.GONE; hud.visibility=View.VISIBLE; controls.removeAllViews(); controls.visibility=View.VISIBLE; panel=true
-        val decoding=problem is PlaybackException && problem.errorCode in 3000..4999
-        val retryable=if(problem is PlaybackException) problem.errorCode in 2000..2999 || problem.errorCode==PlaybackException.ERROR_CODE_TIMEOUT else problem is java.io.IOException
-        playbackText.text=if(decoding) "电视无法解码当前视频，可尝试更低清晰度。" else "播放失败，可重试或切换清晰度。"
+        val incompatibleCodec=problem is java.io.IOException && problem.message?.contains("没有电视可播放的清晰度")==true
+        val decoding=(problem is PlaybackException && problem.errorCode in 3000..4999) || incompatibleCodec
+        val retryable=if(problem is PlaybackException) problem.errorCode in 2000..2999 || problem.errorCode==PlaybackException.ERROR_CODE_TIMEOUT else (problem is java.io.IOException && !incompatibleCodec)
+        playbackText.text=if(decoding) "电视无法解码当前视频，可尝试更低清晰度或选择其他剧集。" else "播放失败，可重试或切换清晰度。"
         val actions=row(); controls.addView(actions)
         addButton(actions,"立即重试") { playEpisode(episodeIndex,retryPosition,retryAutoplay) }.requestFocus()
         addButton(actions,"尝试 720P") { library.maxQuality=720; playEpisode(episodeIndex,retryPosition,retryAutoplay) }

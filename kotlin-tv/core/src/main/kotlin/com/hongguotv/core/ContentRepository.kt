@@ -74,7 +74,7 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
         return registered
     }
 
-    @Volatile private var registrationCookies: Map<String,String> = emptyMap()
+    @Volatile var registrationCookies: Map<String,String> = emptyMap()
         set(value) { field=LinkedHashMap(value) }
 
     private fun deviceProfile(): Map<String,String> =
@@ -318,7 +318,7 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
     private fun videoModel(id: String, allowReRegister: Boolean = true): JSONObject {
         val hosts = listOf(
             "https://api5-normal-lq.fqnovel.com",
-            "https://api5-normal-sinfonlinea.fqnovel.com"
+            "https://api5-normal-lf.fqnovel.com"
         )
         val biz = """{"detail_page_version":0,"device_level":3,"disable_digg_stat":false,"need_all_video_definition":true,"need_mp4_align":false,"use_os_player":false,"use_server_dns":false,"video_platform":1024}"""
         val videoMap = """{"biz_param":$biz,"mixed_video_id_map":{"1004":["$id"]}}"""
@@ -327,6 +327,7 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
             "/novel/player/multi_video_model/v1/" to videoMap
         )
         var failure: IOException? = null
+        var emptyResponseCount = 0
         for (host in hosts) {
             for ((path, body) in candidates) {
                 val attempt = runCatching {
@@ -346,10 +347,20 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
                 val ex = attempt.exceptionOrNull()
                 System.err.println("ContentRepository.videoModel candidate $host$path failed: ${ex?.javaClass?.name}: ${ex?.message}")
                 failure = ex as? IOException ?: IOException(ex?.message ?: "播放接口暂不可用", ex)
+                if (ex?.message == "播放接口暂不可用（空响应）") {
+                    emptyResponseCount++
+                    if (allowReRegister && emptyResponseCount >= 1) {
+                        System.err.println("ContentRepository.videoModel received empty response, refreshing device registration immediately...")
+                        val refreshed = registerDevice()
+                        if (refreshed != null) {
+                            return videoModel(id, allowReRegister = false)
+                        }
+                    }
+                }
             }
         }
         if (allowReRegister) {
-            System.err.println("ContentRepository.videoModel all candidates returned empty or failed, attempting registerDevice refresh...")
+            System.err.println("ContentRepository.videoModel all candidates failed, attempting registerDevice refresh...")
             val refreshed = registerDevice()
             if (refreshed != null) {
                 return videoModel(id, allowReRegister = false)
@@ -371,11 +382,36 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
         else -> null
     }
 
+    private fun fallbackApiCandidates(fallback: String): List<String> {
+        val urls = linkedSetOf<String>()
+        val codecRegex = Regex("([?&]codec_type=)(?:4|2)\\b")
+        if (codecRegex.containsMatchIn(fallback)) {
+            urls += codecRegex.replace(fallback, "$13")
+            urls += codecRegex.replace(fallback, "$11")
+            urls += fallback
+        } else {
+            urls += fallback
+            val anyCodecRegex = Regex("([?&]codec_type=)[0-9]+\\b")
+            if (anyCodecRegex.containsMatchIn(fallback)) {
+                urls += anyCodecRegex.replace(fallback, "$13")
+                urls += anyCodecRegex.replace(fallback, "$11")
+            }
+        }
+        return urls.toList()
+    }
+
+    private fun codecRank(codec: String): Int = when (codec.lowercase()) {
+        "h264", "avc", "avc1", "" -> 0
+        "hevc", "h265", "hvc1", "hev1", "bytevc1" -> 1
+        "bytevc2", "bvc2" -> 2
+        else -> 1
+    }
+
     private fun parseModelStreams(model: JSONObject, maxQuality: Int): StreamInfo? {
+        var hasIncompatible = false
         val list = model.optJSONArray("video_list")
         if (list != null && list.length() > 0) {
-            data class PreloadRow(val quality: Int, val url: String, val spadeA: String, val width: Int = 0, val height: Int = 0)
-            var hasIncompatible = false
+            data class PreloadRow(val quality: Int, val codecRank: Int, val url: String, val spadeA: String, val width: Int = 0, val height: Int = 0)
             val rows = mutableListOf<PreloadRow>()
             for (i in 0 until list.length()) {
                 val v = list.optJSONObject(i) ?: continue
@@ -387,19 +423,22 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
                     hasIncompatible = true
                     continue
                 }
+                val ei = v.optJSONObject("encrypt_info")
+                val spadeA = ei?.str("spade_a").orEmpty().ifEmpty { v.str("spade_a") }
+                val encryptFlag = ei?.opt("encrypt") ?: v.opt("encrypt")
+                val explicitlyUnencrypted = encryptFlag == false || encryptFlag == 0 || encryptFlag == "0" || encryptFlag == "false"
+                // PR #92 defense: if inline video_list omits spade_a without explicitly marking encrypt=false, skip to fallback_api
+                if (spadeA.isEmpty() && !explicitlyUnencrypted && model.has("fallback_api")) {
+                    continue
+                }
                 val height = meta?.optInt("vheight", 0) ?: 0
                 val width = meta?.optInt("vwidth", 0) ?: 0
                 val defStr = meta?.str("definition")?.ifEmpty { meta.str("quality") }.orEmpty()
                 val qNum = if (height > 0) height else qualityNumber(defStr)
-                val ei = v.optJSONObject("encrypt_info")
-                val spadeA = ei?.str("spade_a") ?: v.str("spade_a")
-                rows += PreloadRow(qNum, mainUrl, spadeA, width, height)
-            }
-            if (rows.isEmpty() && hasIncompatible) {
-                throw IOException("没有电视可播放的清晰度，请稍后再试或选择其他剧集")
+                rows += PreloadRow(qNum, codecRank(codec), mainUrl, spadeA, width, height)
             }
             if (rows.isNotEmpty()) {
-                val sorted = rows.sortedByDescending { it.quality }
+                val sorted = rows.sortedWith(compareByDescending<PreloadRow> { it.quality }.thenBy { it.codecRank })
                 val selected = sorted.firstOrNull { it.quality <= maxQuality } ?: sorted.last()
                 val key = selected.spadeA.takeIf { it.isNotEmpty() }?.let(MediaCrypto::deriveKey)
                 val qualityDesc = if (selected.quality > 0) "${selected.quality}P" + (if (selected.quality > maxQuality) "（兼容资源）" else "") else "自动"
@@ -407,35 +446,51 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
             }
         }
 
-        val raw = model.opt("fallback_api") ?: return null
-        val fallback = when (raw) {
+        val raw = model.opt("fallback_api")
+        val fallback = if (raw == null) "" else when (raw) {
             is JSONObject -> raw.str("fallback_api")
             is JSONArray -> raw.optString(0)
             else -> runCatching { JSONObject(raw.toString()).str("fallback_api") }.getOrDefault(raw.toString())
         }
-        if (!fallback.startsWith("https://")) return null
-        val info = try { JSONObject(text(fallback)).optJSONObject("video_info")?.optJSONObject("data") } catch (_: Exception) { null } ?: return null
-        val videoList = info.optJSONObject("video_list") ?: return null
-        var hasIncompatible = false
-        val rows = videoList.keys().asSequence().mapNotNull { k -> videoList.optJSONObject(k)?.let { k to it } }.filter {
-            val codec = it.second.str("codec_type").lowercase()
-            if (codec in setOf("bytevc2", "bvc2")) {
-                hasIncompatible = true
-                false
-            } else {
-                it.second.str("main_url").isNotEmpty()
+        if (fallback.startsWith("https://")) {
+            val expectedVideoId = model.str("video_id")
+            val expectedDuration = model.optDouble("video_duration", -1.0)
+            for (candidateUrl in fallbackApiCandidates(fallback)) {
+                val info = try { JSONObject(text(candidateUrl)).optJSONObject("video_info")?.optJSONObject("data") } catch (_: Exception) { null } ?: continue
+                val fallbackVideoId = info.str("video_id")
+                if (expectedVideoId.isNotEmpty() && fallbackVideoId.isNotEmpty() && fallbackVideoId != expectedVideoId) continue
+                val fallbackDuration = info.optDouble("video_duration", -1.0)
+                if (expectedDuration > 0 && fallbackDuration > 0 && kotlin.math.abs(fallbackDuration - expectedDuration) > 1.5) continue
+                val videoList = info.optJSONObject("video_list") ?: continue
+                val rows = videoList.keys().asSequence().mapNotNull { k -> videoList.optJSONObject(k)?.let { k to it } }.filter {
+                    val codec = it.second.str("codec_type").lowercase()
+                    if (codec in setOf("bytevc2", "bvc2")) {
+                        hasIncompatible = true
+                        false
+                    } else {
+                        it.second.str("main_url").isNotEmpty()
+                    }
+                }.map { (k, o) ->
+                    val qNum = qualityNumber(o.str("quality_desc").ifEmpty { o.str("height").ifEmpty { o.str("vheight").ifEmpty { o.str("quality").ifEmpty { k } } } })
+                    Triple(qNum, codecRank(o.str("codec_type")), o)
+                }.sortedWith(compareByDescending<Triple<Int, Int, JSONObject>> { it.first }.thenBy { it.second }).toList()
+                val selected = rows.firstOrNull { it.first <= maxQuality } ?: rows.lastOrNull() ?: continue
+                val item = selected.third
+                var url = cleanUrl(item.str("main_url"))
+                val seed = info.str("key_seed")
+                if (seed.isNotEmpty()) url = MediaCrypto.decryptUrl(url, decode64(seed))
+                if (!url.startsWith("https://") && !url.startsWith("http://")) throw IOException("播放地址无效")
+                val key = item.str("spade_a").takeIf { it.isNotEmpty() }?.let(MediaCrypto::deriveKey)
+                val quality = if (selected.first > 0) "${selected.first}P" + (if (selected.first > maxQuality) "（兼容资源）" else "") else "自动"
+                val width = item.optInt("vwidth", 0)
+                val height = item.optInt("vheight", 0)
+                return StreamInfo(url, key, quality, width, height)
             }
-        }.map { (k, o) -> Triple(qualityNumber(o.str("quality_desc").ifEmpty { o.str("height").ifEmpty { o.str("vheight").ifEmpty { o.str("quality").ifEmpty { k } } } }), k, o) }.sortedByDescending { it.first }.toList()
-        if (rows.isEmpty() && hasIncompatible) throw IOException("没有电视可播放的清晰度，请稍后再试或选择其他剧集")
-        val selected = rows.firstOrNull { it.first <= maxQuality } ?: rows.lastOrNull() ?: return null
-        val item = selected.third
-        var url = cleanUrl(item.str("main_url"))
-        val seed = info.str("key_seed")
-        if (seed.isNotEmpty()) url = MediaCrypto.decryptUrl(url, decode64(seed))
-        if (!url.startsWith("https://") && !url.startsWith("http://")) throw IOException("播放地址无效")
-        val key = item.str("spade_a").takeIf { it.isNotEmpty() }?.let(MediaCrypto::deriveKey)
-        val quality = if (selected.first > 0) "${selected.first}P" + (if (selected.first > maxQuality) "（兼容资源）" else "") else "自动"
-        return StreamInfo(url, key, quality)
+        }
+        if (hasIncompatible) {
+            throw IOException("没有电视可播放的清晰度，请稍后再试或选择其他剧集")
+        }
+        return null
     }
 
     fun stream(id: String, maxQuality: Int = 1080): StreamInfo {

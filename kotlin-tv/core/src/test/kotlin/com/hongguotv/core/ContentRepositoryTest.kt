@@ -42,6 +42,77 @@ class ContentRepositoryTest {
         assertEquals("720P",repo.stream("123",720).quality)
     }
 
+    @Test fun byteVc2VideoListFallsBackToCodecType3InFallbackApi() {
+        val requestedUrls = mutableListOf<String>()
+        val repo = repository { request ->
+            requestedUrls += request.url.toString()
+            if (request.url.host == "example.com") {
+                val codecType = request.url.queryParameter("codec_type")
+                val rows = JSONObject()
+                if (codecType == "3") {
+                    rows.put("video_1", JSONObject().put("vwidth", 720).put("vheight", 1280).put("codec_type", "bytevc1").put("main_url", "https://example.com/hevc720.mp4"))
+                } else {
+                    rows.put("video_1", JSONObject().put("vwidth", 720).put("vheight", 1280).put("codec_type", "bytevc2").put("main_url", "https://example.com/bvc2.mp4"))
+                }
+                JSONObject().put("video_info", JSONObject().put("data", JSONObject().put("video_list", rows))).toString()
+            } else {
+                val preloadList = JSONArray().put(
+                    JSONObject()
+                        .put("main_url", "https://example.com/preload_bvc2.mp4")
+                        .put("video_meta", JSONObject().put("vwidth", 720).put("vheight", 1280).put("codec_type", "bytevc2").put("definition", "720p"))
+                )
+                val vm = JSONObject()
+                    .put("video_list", preloadList)
+                    .put("fallback_api", "https://example.com/video/fplay?Version=2022-01-01&codec_type=4&v_id=123")
+                JSONObject().put("data", JSONObject().put("123", JSONObject().put("video_model", vm))).toString()
+            }
+        }
+        val result = repo.stream("123", 720)
+        assertEquals("https://example.com/hevc720.mp4", result.url)
+        assertEquals("720P", result.quality)
+        assertEquals(720, result.width)
+        assertEquals(1280, result.height)
+        assertTrue(requestedUrls.any { it.contains("codec_type=3") })
+    }
+
+    @Test fun inlineVideoListMissingSpadeAFallsBackToFallbackApi() {
+        val validSpadeA = "MTIzNDU2Nzg5MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDEyMzQ1Njc4OTA="
+        val repo = repository { request ->
+            if (request.url.host == "example.com") {
+                val rows = JSONObject().put(
+                    "video_1",
+                    JSONObject().put("vwidth", 720).put("vheight", 1280).put("codec_type", "h264").put("main_url", "https://example.com/fallback_h264.mp4").put("encrypt", false)
+                )
+                JSONObject().put("video_info", JSONObject().put("data", JSONObject().put("video_id", "123").put("video_duration", 60.0).put("video_list", rows))).toString()
+            } else {
+                val preloadList = JSONArray().put(
+                    JSONObject()
+                        .put("main_url", "https://example.com/inline_missing_spade.mp4")
+                        .put("video_meta", JSONObject().put("vwidth", 720).put("vheight", 1280).put("codec_type", "bytevc1").put("definition", "720p"))
+                        // No encrypt_info / spade_a and no encrypt=false!
+                )
+                val vm = JSONObject()
+                    .put("video_id", "123")
+                    .put("video_duration", 60.0)
+                    .put("video_list", preloadList)
+                    .put("fallback_api", "https://example.com/video/fplay?v_id=123")
+                JSONObject().put("data", JSONObject().put("123", JSONObject().put("video_model", vm))).toString()
+            }
+        }
+        val result = repo.stream("123", 720)
+        assertEquals("https://example.com/fallback_h264.mp4", result.url)
+    }
+
+    @Test fun sameResolutionPrefersH264OverHevc() {
+        val repo = streamRepository(
+            Triple(720, "bytevc1", "https://example.com/hevc720.mp4"),
+            Triple(720, "h264", "https://example.com/avc720.mp4")
+        )
+        val result = repo.stream("123", 720)
+        assertEquals("https://example.com/avc720.mp4", result.url)
+        assertEquals("720P", result.quality)
+    }
+
     private fun repository(clock: () -> Long = System::currentTimeMillis, respond: (Request) -> String) = ContentRepository(
         OkHttpClient.Builder().addInterceptor { chain ->
             Response.Builder().request(chain.request()).protocol(Protocol.HTTP_1_1)

@@ -7,6 +7,7 @@ import android.os.Handler
 import android.os.Looper
 import android.util.Log
 import com.hongguotv.core.*
+import org.json.JSONObject
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
@@ -138,8 +139,28 @@ class Library(context: Context) {
         val iid = prefs.getString("registered-install-id", null)?.takeIf { it.isNotBlank() } ?: return emptyMap()
         return linkedMapOf("device_id" to did, "iid" to iid)
     }
-    fun saveDeviceIdentity(deviceId: String, installId: String) {
-        prefs.edit().putString("registered-device-id", deviceId).putString("registered-install-id", installId).apply()
+    fun deviceCookies(): Map<String, String> {
+        val raw = prefs.getString("registered-device-cookies", null)?.takeIf { it.isNotBlank() } ?: return emptyMap()
+        return runCatching {
+            val obj = JSONObject(raw)
+            val result = linkedMapOf<String, String>()
+            val iter = obj.keys()
+            while (iter.hasNext()) {
+                val k = iter.next()
+                val v = obj.optString(k, "").trim()
+                if (v.isNotEmpty()) result[k] = v
+            }
+            result
+        }.getOrDefault(emptyMap())
+    }
+    fun saveDeviceIdentity(deviceId: String, installId: String, cookies: Map<String, String> = emptyMap()) {
+        val edit = prefs.edit().putString("registered-device-id", deviceId).putString("registered-install-id", installId)
+        if (cookies.isNotEmpty()) {
+            val obj = JSONObject()
+            cookies.forEach { (k, v) -> if (v.isNotBlank()) obj.put(k, v) }
+            edit.putString("registered-device-cookies", obj.toString())
+        }
+        edit.apply()
     }
     fun observeFavorite(id: String, count: Int, now: Long, acknowledge: Boolean = false) {
         if (state().observeFavorite(id, count, now, acknowledge)) persist("favoriteUpdates")

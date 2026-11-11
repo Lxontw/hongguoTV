@@ -16,7 +16,8 @@ data class BackupSettings(
     val frame: VideoFrameMode = VideoFrameMode.FIT,
     val seamlessNext: Boolean = false,
     val danmakuEnabled: Boolean = false,
-    val mediaSource: MediaSource = MediaSource.HONGGUO
+    val mediaSource: MediaSource = MediaSource.HONGGUO,
+    val disabledSources: Set<MediaSource> = MediaSource.defaultDisabled
 ) {
     fun json() = JSONObject()
         .put("quality", quality)
@@ -27,12 +28,13 @@ data class BackupSettings(
         .put("seamlessNext", seamlessNext)
         .put("danmakuEnabled", danmakuEnabled)
         .put("mediaSource", mediaSource.storedValue)
+        .put("disabledSources", JSONArray(disabledSources.filter { it != MediaSource.HONGGUO }.map { it.storedValue }))
 }
 data class BackupData(val favorites: List<Series>,val history: List<BackupProgress>,val watched: Set<String>,val searches: List<RecentSearch>,val settings: BackupSettings,val later: List<Series> = emptyList(),val hidden: Set<String> = emptySet())
 
 object LibraryBackup {
     const val MAX_BYTES=2*1024*1024
-    internal val idPattern=Regex("^(?:[0-9]{1,30}|xifan:[a-zA-Z0-9_-]{1,32}:[a-zA-Z0-9_-]{1,96}(?::[a-zA-Z0-9_-]{1,96})?|hema:[0-9]{1,30}(?::[0-9]{1,30})?)$")
+    internal val idPattern=Regex("^(?:[0-9]{1,30}|xifan:[a-zA-Z0-9_-]{1,32}:[a-zA-Z0-9_-]{1,96}(?::[a-zA-Z0-9_-]{1,96})?|hema:[0-9]{1,30}(?::[0-9]{1,30})?|dramabox:[0-9]{1,24}(?::[0-9]{1,24})?|reelshort:[a-zA-Z0-9_]{1,100}:[a-z0-9-]{1,200}(?::[1-9][0-9]{0,3}:[a-zA-Z0-9_]{1,100})?)$")
     private fun id(value: String)=value.also { require(idPattern.matches(it)) { "剧集标识无效" } }
     private fun cleanCover(value: String): String=runCatching {
         val uri=URI(value); val host=uri.host.orEmpty().lowercase()
@@ -61,7 +63,7 @@ object LibraryBackup {
         val array=getJSONArray(key); require(array.length()<=max) { "记录数量超过上限" }
         return (0 until array.length()).map { array.getJSONObject(it) }
     }
-    private fun series(o: JSONObject): Series = Series(id(o.string("id",240)),o.string("title",200).also { require(it.isNotBlank()) },cleanCover(o.string("cover",2048)),"",o.string("badge",100),o.string("tags",200))
+    private fun series(o: JSONObject): Series = Series(id(o.string("id",420)),o.string("title",200).also { require(it.isNotBlank()) },cleanCover(o.string("cover",2048)),"",o.string("badge",100),o.string("tags",200))
     fun decode(value: String): BackupData {
         require(value.toByteArray(Charsets.UTF_8).size<=MAX_BYTES) { "备份超过 2 MB 限制" }
         var depth=0; var quoted=false; var escaped=false
@@ -81,7 +83,7 @@ object LibraryBackup {
         val favorites=o.rows("favorites",500).map(::series)
         val history=o.rows("history",200).map { row ->
             val duration=row.number("duration",604_800_000)
-            BackupProgress(series(row.getJSONObject("series")),id(row.string("episodeId",240)),row.number("episodeIndex",100_000).toInt(),row.number("position",604_800_000).let { if(duration>0) minOf(it,duration) else it },duration,row.get("completed").also { require(it is Boolean) } as Boolean,row.number("updatedAt",4_102_444_800_000))
+            BackupProgress(series(row.getJSONObject("series")),id(row.string("episodeId",420)),row.number("episodeIndex",100_000).toInt(),row.number("position",604_800_000).let { if(duration>0) minOf(it,duration) else it },duration,row.get("completed").also { require(it is Boolean) } as Boolean,row.number("updatedAt",4_102_444_800_000))
         }
         require(favorites.distinctBy { it.id }.size==favorites.size && history.distinctBy { it.series.id }.size==history.size) { "备份包含重复剧集" }
         val watched=o.getJSONArray("watched"); require(watched.length()<=500)
@@ -96,7 +98,10 @@ object LibraryBackup {
         val seamlessNext=if(settings.has("seamlessNext")) { val v=settings.get("seamlessNext"); require(v is Boolean); v } else false
         val danmakuEnabled=if(settings.has("danmakuEnabled")) { val v=settings.get("danmakuEnabled"); require(v is Boolean); v } else false
         val mediaSource=if(settings.has("mediaSource")) MediaSource.fromStored(settings.string("mediaSource",20)) else MediaSource.HONGGUO
-        return BackupData(favorites,history,watchedIds,searches,BackupSettings(quality,speed.toFloat(),autoNext,type,frame,seamlessNext,danmakuEnabled,mediaSource),later,hiddenIds)
+        val disabled = settings.optJSONArray("disabledSources") ?: JSONArray(MediaSource.defaultDisabled.map { it.storedValue })
+        val disabledSources = (0 until disabled.length()).map { MediaSource.fromStored(disabled.optString(it)) }.filter { it != MediaSource.HONGGUO }.toSet()
+        val selectedSource = mediaSource.takeUnless { it in disabledSources } ?: MediaSource.HONGGUO
+        return BackupData(favorites,history,watchedIds,searches,BackupSettings(quality,speed.toFloat(),autoNext,type,frame,seamlessNext,danmakuEnabled,selectedSource,disabledSources),later,hiddenIds)
     }
     /** Existing favorites stay first; only newer imported progress replaces a local record. */
     fun merge(local: BackupData,incoming: BackupData,restoreSettings: Boolean): BackupData {

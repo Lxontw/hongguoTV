@@ -7,15 +7,20 @@ import java.net.URI
 enum class MediaSource(val storedValue: String, val label: String) {
     HONGGUO("hongguo", "红果"),
     XIFAN("xifan", "稀饭"),
-    HEMA("hema", "河马");
+    HEMA("hema", "河马"),
+    REELSHORT("reelshort", "ReelShort（海外）"),
+    DRAMABOX("dramabox", "DramaBox（海外）");
 
     companion object {
+        val defaultDisabled = setOf(REELSHORT, DRAMABOX)
         fun fromStored(value: String?): MediaSource =
             entries.firstOrNull { it.storedValue == value } ?: HONGGUO
 
         fun fromSeriesOrEpisodeId(id: String): MediaSource = when {
             id.startsWith("xifan:") -> XIFAN
             id.startsWith("hema:") -> HEMA
+            id.startsWith("reelshort:") -> REELSHORT
+            id.startsWith("dramabox:") -> DRAMABOX
             else -> HONGGUO
         }
     }

@@ -44,10 +44,10 @@ class TvTools(private val activity: Activity) {
         val next=AlertDialog.Builder(activity).setTitle(title).setMessage(message).setNegativeButton("取消",null).setPositiveButton("确认") { _,_-> action() }.create()
         open(next,anchor); next.getButton(AlertDialog.BUTTON_NEGATIVE).requestFocus()
     }
-    fun choose(title: String,labels: List<String>,anchor: View?,onChoice: (Int)->Unit,extra: String?=null,onExtra: ()->Unit={}) {
+    fun choose(title: String,labels: List<String>,anchor: View?,onChoice: (Int)->Unit,extra: String?=null,selectedIndex: Int=0,onExtra: ()->Unit={}) {
         val builder=AlertDialog.Builder(activity).setTitle(title).setItems(labels.toTypedArray()) { _,index-> onChoice(index) }.setNegativeButton("取消",null)
         if(extra!=null) builder.setNeutralButton(extra) { _,_-> onExtra() }
-        val next=builder.create(); open(next,anchor); next.listView.requestFocus()
+        val next=builder.create(); open(next,anchor); next.listView.setSelection(selectedIndex); next.listView.requestFocus()
     }
     fun episodePicker(count: Int,current: Int,anchor: View?,select: (Int)->Unit) {
         val content=column(); var digits=(current+1).toString(); var replace=true

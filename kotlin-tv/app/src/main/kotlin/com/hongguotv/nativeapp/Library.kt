@@ -200,6 +200,15 @@ class Library(context: Context) {
     var danmakuEnabled: Boolean
         get() = state().settings.danmakuEnabled
         set(value) { if (value != danmakuEnabled) { state().settings = state().settings.copy(danmakuEnabled = value); put("danmakuEnabled", value) } }
+    val enabledSources: List<MediaSource>
+        get() = MediaSource.entries.filter { it !in state().settings.disabledSources || it == MediaSource.HONGGUO }
+    fun setSourceEnabled(source: MediaSource, enabled: Boolean) {
+        if (source == MediaSource.HONGGUO) return
+        val disabled = if (enabled) state().settings.disabledSources - source else state().settings.disabledSources + source
+        state().settings = state().settings.copy(disabledSources = disabled)
+        put("disabledSources", disabled.map { it.storedValue }.toSet())
+        if (mediaSource !in enabledSources) mediaSource = MediaSource.HONGGUO
+    }
     var mediaSource: MediaSource
         get() = state().settings.mediaSource
         set(value) { if (value != mediaSource) { state().settings = state().settings.copy(mediaSource = value); put("mediaSource", value.storedValue) } }
@@ -209,6 +218,7 @@ class Library(context: Context) {
         index = LibraryIndex(merged, state().updates())
         persist("favorites", "later", "progress", "watched", "hidden", "searches", "favoriteUpdates")
         writes.submit(mapOf("quality" to { merged.settings.quality }, "playbackSpeed" to { merged.settings.speed },
+            "disabledSources" to { merged.settings.disabledSources.map { it.storedValue }.toSet() },
             "autoNext" to { merged.settings.autoNext }, "seamlessNext" to { merged.settings.seamlessNext }, "danmakuEnabled" to { merged.settings.danmakuEnabled }, "mediaSource" to { merged.settings.mediaSource.storedValue }, "contentType" to { merged.settings.type.storedValue }, "frameMode" to { merged.settings.frame.name }))
         flush()
     }

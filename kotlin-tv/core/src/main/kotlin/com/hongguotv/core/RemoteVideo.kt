@@ -18,7 +18,7 @@ class RemoteVideo(private val http: OkHttpClient, val info: StreamInfo): Closeab
     private fun range(start: Long,end: Long): Range {
         if(closed) throw IOException("播放请求已取消")
         require(start>=0 && end>=start && end-start<8*1024*1024)
-        val request=Request.Builder().url(info.url).header("User-Agent",VendorConstants.VIDEO_UA).header("Referer","https://novel.snssdk.com/").header("Range","bytes=$start-$end").header("Accept-Encoding","identity").build()
+        val request=Request.Builder().url(info.url).header("User-Agent",info.userAgent).header("Referer",info.referer).header("Range","bytes=$start-$end").header("Accept-Encoding","identity").build()
         val call=http.newCall(request)
         synchronized(calls) { if(closed) throw IOException("播放请求已取消"); calls+=call }
         try {
@@ -36,7 +36,8 @@ class RemoteVideo(private val http: OkHttpClient, val info: StreamInfo): Closeab
         } finally { synchronized(calls) { calls-=call } }
     }
     @Synchronized fun prepare(): RemoteVideo {
-        if(::prepared.isInitialized) return this
+        if(closed) throw IOException("播放请求已取消")
+        if(info.hls || ::prepared.isInitialized) return this
         val first=range(0,256*1024-1); total=first.total
         prefix=first.bytes
         val end=MediaCrypto.headerEnd(first.bytes,total)
@@ -48,6 +49,7 @@ class RemoteVideo(private val http: OkHttpClient, val info: StreamInfo): Closeab
     /** Bounded warm-up. Retains raw bytes so decryption still uses the absolute sample offset. */
     @Synchronized fun warm(): RemoteVideo {
         prepare()
+        if(info.hls) return this
         val size=minOf(total,1024*1024L).toInt()
         if(prefix.size<size) prefix=prefix+range(prefix.size.toLong(),size-1L).bytes
         return this

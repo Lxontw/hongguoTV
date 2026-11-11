@@ -22,6 +22,8 @@ import androidx.media3.common.*
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.source.ProgressiveMediaSource
+import androidx.media3.exoplayer.hls.HlsMediaSource
+import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.ui.PlayerView
 import com.hongguotv.core.*
 import java.util.concurrent.Executors
@@ -122,6 +124,8 @@ class MainActivity: Activity() {
     private var playerView: PlayerView?=null
     private var danmakuOverlay: DanmakuOverlayView?=null
     private var danmakuJob: java.util.concurrent.Future<*>?=null
+    private var danmakuRequestId=0L
+    private var danmakuScope: RequestScope?=null
     private val danmakuWorker=Executors.newSingleThreadExecutor()
     private val danmakuTick=object: Runnable {
         override fun run() {
@@ -393,7 +397,7 @@ class MainActivity: Activity() {
         showCatalog(load=true, focusGenre=true)
     }
     private fun showSourcePicker(anchor: TextView, inSettings: Boolean=false) {
-        val sources=MediaSource.entries
+        val sources=library.enabledSources
         val labels=sources.map { "${it.label}剧场" + (if(library.mediaSource==it) "（当前）" else "") }
         tvTools.choose("切换片源平台",labels,anchor,{ idx ->
             val target=sources.getOrNull(idx) ?: return@choose
@@ -479,7 +483,7 @@ class MainActivity: Activity() {
             }
             nav.forEach { it.nextFocusDownId=typeButtons.getValue(library.contentType).id }
         }
-        if(tab==0 && collection==null && library.mediaSource!=MediaSource.HEMA) {
+        if(tab==0 && collection==null && library.mediaSource in setOf(MediaSource.HONGGUO,MediaSource.XIFAN)) {
             val genres=if(availableGenres.isNotEmpty()) availableGenres else if(library.mediaSource==MediaSource.XIFAN) {
                 listOf(GenreFilter("","全部推荐"),GenreFilter(AppCategoryCatalog.NEW_TODAY_ID,"今日上新"))
             } else repository.defaultGenres(library.contentType)
@@ -944,6 +948,30 @@ class MainActivity: Activity() {
         sourceSettingButton=setting(playback,"默认片源平台  ·  ${library.mediaSource.label}") {
             showSourcePicker(sourceSettingButton, true)
         }
+        lateinit var sourceVisibilityButton: TextView
+        sourceVisibilityButton=setting(playback,"片源开关管理") {
+            fun chooseSource(selectedIndex: Int=0) {
+                val sources=MediaSource.entries
+                val labels=sources.map { "${it.label}  ·  " + when {
+                    it==MediaSource.HONGGUO -> "始终开启"
+                    it in library.enabledSources -> "开启"
+                    else -> "关闭"
+                } }
+                tvTools.choose("片源开关（红果始终开启）",labels,sourceVisibilityButton,{ idx ->
+                    val source=sources.getOrNull(idx) ?: return@choose
+                    if(source!=MediaSource.HONGGUO) {
+                        library.setSourceEnabled(source,source !in library.enabledSources)
+                        selectedGenreId=""; availableGenres=emptyList()
+                        tabState.clear(); tabFocus.clear()
+                        releaseCatalogViews()
+                        page=1; catalog=emptyList(); hasMore=false; ranking=null; catalogFocus=""; homePosition=null
+                        sourceSettingButton.text="默认片源平台  ·  ${library.mediaSource.label}"
+                    }
+                    main.post { if(screen=="catalog" && tab==5) chooseSource(idx) }
+                }, selectedIndex=selectedIndex)
+            }
+            chooseSource()
+        }
         lateinit var updates: TextView
         updates=setting(device,settingsUpdateLabel()) { updater.show(updates) }
         settingsUpdateButton=updates
@@ -965,7 +993,7 @@ class MainActivity: Activity() {
         val license=setting(device,"开源许可") {
             AlertDialog.Builder(this).setTitle("开源许可").setMessage("本原生版以 GPL-3.0 发布。\n内容协议与加密处理移植自 drpys（22261ad）。\nAndroidX Media3 / OkHttp：Apache-2.0\nKotlin：Apache-2.0\nBouncy Castle：MIT\n完整源码和许可证见 GitHub：Lxontw/hongguoTV。").setPositiveButton("关闭",null).show()
         }
-        val left=listOf(qualityButton,defaultSpeed,frame,autoNextButton,seamlessNextButton,danmakuButton,sourceSettingButton); val right=listOf(updates,backup,hidden,license)
+        val left=listOf(qualityButton,defaultSpeed,frame,autoNextButton,seamlessNextButton,danmakuButton,sourceSettingButton,sourceVisibilityButton); val right=listOf(updates,backup,hidden,license)
         listOf(left,right).forEach { items -> items.forEachIndexed { index,view ->
             view.nextFocusUpId=items.getOrNull(index-1)?.id ?: nav[tab].id
             view.nextFocusDownId=items.getOrNull(index+1)?.id ?: view.id
@@ -1317,12 +1345,23 @@ class MainActivity: Activity() {
                 override fun onPlayerError(error: PlaybackException) { if(active()) playerFailure(error) }
             }
             playerListener=listener; p.addListener(listener)
-            val source=ProgressiveMediaSource.Factory { VideoDataSource(remote) }.createMediaSource(MediaItem.Builder().setMediaId(requestedId).setUri("hongguotv://episode/$requestedId").setMimeType(MimeTypes.VIDEO_MP4).build())
+            val source=episodeMediaSource(remote,requestedId)
             p.setMediaSource(source); p.seekTo(position.coerceAtLeast(0)); p.prepare(); p.playWhenReady=foreground && requestedAutoplay && !pausedForLifecycle && episodePanel==null
         }, { problem ->
             android.util.Log.e("HongguoTV","playEpisode work error for episode=${episodeIndex+1}: ${problem.javaClass.name}: ${problem.message}", problem)
             playerFailure(problem)
         })
+    }
+    private fun episodeMediaSource(remote: RemoteVideo,id: String): androidx.media3.exoplayer.source.MediaSource {
+        if(remote.info.hls) {
+            val http=DefaultHttpDataSource.Factory().setUserAgent(remote.info.userAgent)
+                .setDefaultRequestProperties(mapOf("Referer" to remote.info.referer))
+                .setConnectTimeoutMs(15_000).setReadTimeoutMs(30_000)
+            return HlsMediaSource.Factory(http).createMediaSource(
+                MediaItem.Builder().setMediaId(id).setUri(remote.info.url).setMimeType(MimeTypes.APPLICATION_M3U8).build())
+        }
+        return ProgressiveMediaSource.Factory { VideoDataSource(remote) }.createMediaSource(
+            MediaItem.Builder().setMediaId(id).setUri("hongguotv://episode/$id").setMimeType(MimeTypes.VIDEO_MP4).build())
     }
     private fun closeTransport(http: okhttp3.OkHttpClient?) {
         if(http==null) return
@@ -1351,8 +1390,7 @@ class MainActivity: Activity() {
         queuedVideo=claimedVideo
         queuedHttp=claimedHttp
         queuedEpisodeId=id
-        val source=ProgressiveMediaSource.Factory { VideoDataSource(claimedVideo) }
-            .createMediaSource(MediaItem.Builder().setMediaId(id).setUri("hongguotv://episode/$id").setMimeType(MimeTypes.VIDEO_MP4).build())
+        val source=episodeMediaSource(claimedVideo,id)
         p.addMediaSource(source)
         android.util.Log.i("HongguoTV","Seamless next episode added to player playlist: $id")
     }
@@ -1670,15 +1708,20 @@ class MainActivity: Activity() {
         library.save(WatchProgress(data.series,data.episodes[episodeIndex],episodeIndex,p.currentPosition.coerceAtLeast(0),p.duration.coerceAtLeast(0),completed || p.playbackState==Player.STATE_ENDED,System.currentTimeMillis()))
     }
     private fun requestDanmakuForEpisode(videoId: String, initialPositionMs: Long, ticket: Int, notifyResult: Boolean = false) {
+        val requestId = ++danmakuRequestId
+        danmakuScope?.cancel(); danmakuScope=null
         danmakuJob?.cancel(true)
         danmakuJob = null
         if (!library.danmakuEnabled) return
         val seriesId = detail?.series?.id.orEmpty()
+        val scope = RequestScope().also { danmakuScope=it }
         danmakuJob = danmakuWorker.submit {
-            val items = runCatching { repository.danmaku(videoId, seriesId) }.getOrDefault(emptyList())
+            val items = runCatching { scope.run { repository.danmaku(videoId, seriesId) } }.getOrDefault(emptyList())
             main.post {
-                if (!isDestroyed && generation == ticket && screen == "player" && library.danmakuEnabled) {
-                    val pos = currentPosition().coerceAtLeast(initialPositionMs)
+                if (!isDestroyed && generation == ticket && screen == "player" && library.danmakuEnabled
+                    && requestId == danmakuRequestId && detail?.series?.id == seriesId
+                    && detail?.episodes?.getOrNull(episodeIndex) == videoId) {
+                    val pos = if (playbackReady) currentPosition().coerceAtLeast(0L) else initialPositionMs
                     danmakuOverlay?.loadTimeline(items, pos)
                     danmakuOverlay?.syncPlayback(pos, player?.isPlaying == true)
                     if (notifyResult) {
@@ -1692,6 +1735,7 @@ class MainActivity: Activity() {
 
     private fun releasePlayer() {
         cancelRecovery(); cancelPrefetch(); clearQueuedMedia(); mediaSession.deactivate(); tvTools.close()
+        ++danmakuRequestId; danmakuScope?.cancel(); danmakuScope=null
         danmakuJob?.cancel(true); danmakuJob=null
         main.removeCallbacks(danmakuTick)
         danmakuOverlay?.clearTimeline(); danmakuOverlay=null

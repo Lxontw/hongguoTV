@@ -52,7 +52,7 @@ data class Detail(val series: Series, val episodes: List<String>)
 data class RankPosition(val rank: Int?, val heat: String)
 data class ComicRanking(val positions: Map<String,RankPosition>, val totalPages: Int, val updatedText: String)
 data class CatalogPage(val items: List<Series>, val hasMore: Boolean, val ranking: ComicRanking? = null, val genres: List<GenreFilter> = emptyList())
-data class StreamInfo(val url: String, val key: ByteArray?, val quality: String, val width: Int = 0, val height: Int = 0)
+data class StreamInfo(val url: String, val key: ByteArray?, val quality: String, val width: Int = 0, val height: Int = 0, val referer: String = "https://novel.snssdk.com/", val userAgent: String = VendorConstants.VIDEO_UA, val hls: Boolean = false)
 class SearchSessionExpiredException: IOException("搜索结果已过期，请从第 1 页重新搜索")
 
 class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectTimeout(15,TimeUnit.SECONDS).readTimeout(30,TimeUnit.SECONDS).callTimeout(45,TimeUnit.SECONDS).build(), private val clock: () -> Long = System::currentTimeMillis) {
@@ -60,6 +60,8 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
     private val site = "https://hongguoduanju.com"
     private val xifan = XifanRepository(http)
     private val hema = HemaRepository(http)
+    private val reelshort = OverseasRepository(http, MediaSource.REELSHORT)
+    private val dramabox = OverseasRepository(http, MediaSource.DRAMABOX)
     private data class SearchCursor(val searchId: String, val passback: String, val offset: Int?, val updatedAt: Long)
     private val searchCursors=linkedMapOf<Triple<ContentType,String,Int>,SearchCursor>()
     private data class CategoryCursor(val offset: Int, val sessionId: String, val genres: List<GenreFilter>, val updatedAt: Long)
@@ -251,6 +253,8 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
         when (source) {
             MediaSource.XIFAN -> return xifan.home(page, genreId)
             MediaSource.HEMA -> return hema.home(page)
+            MediaSource.REELSHORT -> return reelshort.home(page)
+            MediaSource.DRAMABOX -> return dramabox.home(page)
             MediaSource.HONGGUO -> {}
         }
         if (genreId.isNotBlank()) {
@@ -274,6 +278,8 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
         when (source) {
             MediaSource.XIFAN -> return xifan.search(query, page)
             MediaSource.HEMA -> return hema.search(query, page)
+            MediaSource.REELSHORT -> return reelshort.search(query, page)
+            MediaSource.DRAMABOX -> return dramabox.search(query, page)
             MediaSource.HONGGUO -> {}
         }
         // The website search does not constrain content type. Never use it for comics.
@@ -415,6 +421,8 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
         when (MediaSource.fromSeriesOrEpisodeId(id)) {
             MediaSource.XIFAN -> return xifan.detail(id)
             MediaSource.HEMA -> return hema.detail(id)
+            MediaSource.REELSHORT -> return reelshort.detail(id)
+            MediaSource.DRAMABOX -> return dramabox.detail(id)
             MediaSource.HONGGUO -> {}
         }
         require(id.matches(Regex("[0-9]{1,30}")))
@@ -639,7 +647,7 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
             else -> emptyList()
         }
         if (inlineObjects.isNotEmpty()) {
-            data class PreloadRow(val quality: Int, val codecRank: Int, val url: String, val spadeA: String, val width: Int = 0, val height: Int = 0)
+            data class PreloadRow(val quality: Int, val codecRank: Int, val url: String, val spadeA: String, val width: Int = 0, val height: Int = 0, val referer: String = "https://novel.snssdk.com/", val userAgent: String = VendorConstants.VIDEO_UA, val hls: Boolean = false)
             val rows = mutableListOf<PreloadRow>()
             for (v in inlineObjects) {
                 val mainUrl = cleanUrl(v.str("main_url"))
@@ -728,6 +736,8 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
         when (MediaSource.fromSeriesOrEpisodeId(id)) {
             MediaSource.XIFAN -> return xifan.stream(id)
             MediaSource.HEMA -> return hema.stream(id)
+            MediaSource.REELSHORT -> return reelshort.stream(id)
+            MediaSource.DRAMABOX -> return dramabox.stream(id)
             MediaSource.HONGGUO -> {}
         }
         require(id.matches(Regex("[0-9]{1,30}")))

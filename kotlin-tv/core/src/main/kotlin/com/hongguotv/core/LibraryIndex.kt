@@ -101,6 +101,7 @@ object LibraryDisk {
         }
         val rawUpdates = runCatching { JSONObject(values["favoriteUpdates"] as? String ?: "{}") }.getOrDefault(JSONObject())
         val updates = rawUpdates.keys().asSequence().mapNotNull { id -> FavoriteUpdate.decode(rawUpdates.optJSONObject(id))?.let { id to it } }.toMap()
+        val disabledSources = if (values.containsKey("disabledSources")) ids("disabledSources").map(MediaSource::fromStored).filter { it != MediaSource.HONGGUO }.toSet() else MediaSource.defaultDisabled
         val settings = BackupSettings(
             PlaybackQuality.normalize((values["quality"] as? Number)?.toInt() ?: 1080),
             PlaybackSpeed.normalize((values["playbackSpeed"] as? Number)?.toFloat() ?: 1f),
@@ -109,7 +110,8 @@ object LibraryDisk {
             VideoFrameMode.fromStored(values["frameMode"] as? String),
             values["seamlessNext"] as? Boolean ?: false,
             values["danmakuEnabled"] as? Boolean ?: false,
-            MediaSource.fromStored(values["mediaSource"] as? String)
+            MediaSource.fromStored(values["mediaSource"] as? String).takeUnless { it in disabledSources } ?: MediaSource.HONGGUO,
+            disabledSources
         )
         return LibraryIndex(BackupData(series("favorites"), history, ids("watched"),
             SearchHistory.decode(values["searches"] as? String ?: "[]"), settings, series("later"), ids("hidden")), updates)

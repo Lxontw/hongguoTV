@@ -22,3 +22,10 @@
 - JUnit（仅测试）：https://github.com/junit-team/junit4 — EPL-1.0
 
 应用图标和 TV banner 沿用本仓库素材。这里的应用不是内容平台官方客户端。
+
+海外公開片源的頁面路由與資料結構參考 `jackotom/hongguo-drama` v7.0 隨附的 `src/native/reelshort.js`、`src/native/dramabox.js`，以 Kotlin 重新實作；不包含登入、付費解鎖或評論補位。上游專案：https://github.com/jackotom/hongguo-drama （GPL-3.0）。其來源聲明另列：
+
+- ReelShort：wanglinsaputra/Rest-Api-ReelShort（MIT），https://github.com/wanglinsaputra/Rest-Api-ReelShort 。授權全文見 `licenses/LICENSE.ReelShort.txt`。
+- DramaBox：zuomeizuoyang/shortdrama-player，commit `081e7ee7`（MIT），https://github.com/zuomeizuoyang/shortdrama-player/tree/081e7ee7 。授權全文見 `licenses/LICENSE.DramaBox.txt`。
+
+本次差異：電視版支援 ReelShort 公開 MP4 / HLS 影片，以及 DramaBox 公開未加密 MP4 影片；海外來源預設關閉，並沿用本機播放記錄與備份。

@@ -12,8 +12,8 @@ android {
         applicationId = "com.hongguotv.nativeapp"
         minSdk = 26
         targetSdk = 34
-        versionCode = System.getenv("HONGGUOTV_VERSION_CODE")?.toInt() ?: 20
-        versionName = System.getenv("HONGGUOTV_VERSION_NAME") ?: "0.9.11"
+        versionCode = System.getenv("HONGGUOTV_VERSION_CODE")?.toInt() ?: 21
+        versionName = System.getenv("HONGGUOTV_VERSION_NAME") ?: "0.9.12-rc1"
     }
     buildFeatures { buildConfig = true }
     signingConfigs {
@@ -49,5 +49,6 @@ dependencies {
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation(project(":core")) { exclude(group = "org.json") }
     implementation("androidx.media3:media3-exoplayer:1.3.1")
+    implementation("androidx.media3:media3-exoplayer-hls:1.3.1")
     implementation("androidx.media3:media3-ui:1.3.1")
 }

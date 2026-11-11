@@ -367,19 +367,46 @@ class ContentRepositoryTest {
         assertFalse(candidates[0].contains("encode_user_tag"))
     }
 
-    @Test fun emptyPostPlaybackRecoversViaSignedVideoTabMultiVideoModel() {
+    @Test fun primaryVideoTabPlaybackUsesPlayerSignerAndRecoversViaGzippedLegacyMultiVideoModel() {
         val requests = mutableListOf<Request>()
         val repo = repository { request ->
             requests += request
-            if (request.method == "POST") {
-                ""
-            } else {
-                assertEquals("/reading/bookapi/video_tab/multi_video_model/v1/", request.url.encodedPath)
-                assertEquals("73932", request.url.queryParameter("version_code"))
-                assertEquals("7.3.9.32", request.url.queryParameter("version_name"))
-                assertEquals("7700946421087751193", request.url.queryParameter("video_id"))
-                JSONObject().put("code", 0).put("data", JSONObject().put(
-                    "video_model_data", JSONObject().put(
+            when (request.url.encodedPath) {
+                "/reading/bookapi/video_tab/multi_video_model/v1/" -> {
+                    assertEquals("GET", request.method)
+                    assertEquals("73932", request.url.queryParameter("version_code"))
+                    assertEquals("7.3.9.32", request.url.queryParameter("version_name"))
+                    assertEquals("7700946421087751193", request.url.queryParameter("video_id"))
+                    assertNull(request.header("x-gorgon"))
+                    assertNull(request.header("x-medusa"))
+                    assertNull(request.header("x-helios"))
+                    assertNull(request.header("x-ss-stub"))
+                    assertTrue(decode64(request.header("x-argus").orEmpty()).size > 4)
+                    assertTrue(decode64(request.header("x-ladon").orEmpty()).size > 4)
+                    ""
+                }
+                "/service/2/device_register/" -> {
+                    JSONObject().put("device_id_str", "9007199254740993").put("install_id_str", "9007199254741993").toString()
+                }
+                "/novel/player/multi_video_model/v1/" -> {
+                    assertEquals("POST", request.method)
+                    assertEquals("74332", request.url.queryParameter("version_code"))
+                    assertEquals("7.4.3.32", request.url.queryParameter("version_name"))
+                    assertEquals("9007199254740993", request.url.queryParameter("device_id"))
+                    assertEquals("gzip", request.header("Content-Encoding"))
+                    assertNull(request.header("x-gorgon"))
+                    assertNull(request.header("x-medusa"))
+                    assertNull(request.header("x-helios"))
+                    assertTrue(decode64(request.header("x-argus").orEmpty()).size > 4)
+                    assertTrue(decode64(request.header("x-ladon").orEmpty()).size > 4)
+                    val buffer = okio.Buffer()
+                    request.body!!.writeTo(buffer)
+                    val rawGzip = buffer.readByteArray()
+                    assertEquals(digest("MD5", rawGzip).hex(), request.header("x-ss-stub"))
+                    val gunzipped = java.util.zip.GZIPInputStream(rawGzip.inputStream()).readBytes().toString(Charsets.UTF_8)
+                    val payload = JSONObject(gunzipped)
+                    assertEquals("7700946421087751193", payload.getJSONObject("mixed_video_id_map").getJSONArray("1004").getString(0))
+                    JSONObject().put("code", 0).put("data", JSONObject().put(
                         "7700946421087751193", JSONObject().put(
                             "video_model", JSONObject()
                                 .put("video_id", "vid-770")
@@ -394,8 +421,9 @@ class ContentRepositoryTest {
                                         .put("encrypt_info", JSONObject().put("encrypt", false))
                                 ))
                         )
-                    )
-                )).toString()
+                    )).toString()
+                }
+                else -> error("Unexpected path: ${request.url.encodedPath}")
             }
         }
         val stream = repo.stream("7700946421087751193", 1080)
@@ -403,6 +431,26 @@ class ContentRepositoryTest {
         assertEquals("1920P（兼容资源）", stream.quality)
         assertEquals(1080, stream.width)
         assertEquals(1920, stream.height)
+        assertEquals(3, requests.size)
+    }
+
+    @Test fun renewalRefusalStopsLegacyRecovery() {
+        val requests = mutableListOf<Request>()
+        val repo = ContentRepository(
+            OkHttpClient.Builder().addInterceptor { chain ->
+                val req = chain.request()
+                requests += req
+                if (req.url.encodedPath == "/service/2/device_register/") {
+                    Response.Builder().request(req).protocol(Protocol.HTTP_1_1)
+                        .code(429).message("Too Many Requests").body("".toResponseBody()).build()
+                } else {
+                    Response.Builder().request(req).protocol(Protocol.HTTP_1_1)
+                        .code(200).message("OK").body("".toResponseBody()).build()
+                }
+            }.build()
+        )
+        assertThrows(IOException::class.java) { repo.stream("7700946421087751193", 1080) }
+        assertEquals(listOf("/reading/bookapi/video_tab/multi_video_model/v1/", "/service/2/device_register/"), requests.map { it.url.encodedPath })
     }
 
     @Test fun appCategoryCatalogExtractsThemesNewTodayBadgeAndCursor() {

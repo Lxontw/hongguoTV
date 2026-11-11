@@ -424,95 +424,147 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
         if(episodes.isEmpty() || episodes.any { !it.matches(Regex("[0-9]{1,30}")) } || episodes.distinct().size!=episodes.size) throw IOException("分集数据异常")
         return Detail(card(o).copy(id=id),episodes)
     }
-    private fun videoModel(id: String, allowReRegister: Boolean = true): JSONObject {
-        val hosts = listOf(
-            "https://api5-normal-lq.fqnovel.com",
-            "https://api5-normal-lf.fqnovel.com"
-        )
-        val biz = """{"detail_page_version":0,"device_level":3,"disable_digg_stat":false,"need_all_video_definition":true,"need_mp4_align":false,"use_os_player":false,"use_server_dns":false,"video_platform":1024}"""
-        val videoMap = """{"biz_param":$biz,"mixed_video_id_map":{"1004":["$id"]}}"""
-        val candidates = listOf(
-            "/novel/player/video_model/v1/" to """{"video_id":"$id","biz_param":$biz}""",
-            "/novel/player/multi_video_model/v1/" to videoMap
-        )
-        var failure: IOException? = null
-        var emptyResponseCount = 0
-        for (host in hosts) {
-            for ((path, body) in candidates) {
-                val attempt = runCatching {
-                    val payload = body.toByteArray()
-                    val cookie = registrationCookies.entries.joinToString("; ") { (name, value) -> "$name=$value" }.takeIf { it.isNotEmpty() }
-                    val signed = signer.sign(host + path, deviceProfile(), payload)
-                    val request = if (cookie == null) signed else signed.copy(headers = signed.headers + linkedMapOf("Cookie" to cookie))
-                    val response = text(signed.url, request)
-                    if (response.isBlank()) throw IOException("播放接口暂不可用（空响应）")
-                    val data = JSONObject(response)
-                    val code = data.optInt("Code", data.optInt("code", 0))
-                    if (code != 0) throw IOException("播放接口暂不可用（${code}）")
-                    videoModelOf(data, id) ?: throw IOException("播放接口暂不可用（没有播放模型）")
-                }
-                val model = attempt.getOrNull()
-                if (model != null) return model
-                val ex = attempt.exceptionOrNull()
-                System.err.println("ContentRepository.videoModel candidate $host$path failed: ${ex?.javaClass?.name}: ${ex?.message}")
-                failure = ex as? IOException ?: IOException(ex?.message ?: "播放接口暂不可用", ex)
-                if (ex?.message == "播放接口暂不可用（空响应）") {
-                    emptyResponseCount++
-                    if (allowReRegister && emptyResponseCount >= 1) {
-                        System.err.println("ContentRepository.videoModel received empty response, refreshing device registration immediately...")
-                        val refreshed = registerDevice()
-                        if (refreshed != null) {
-                            return videoModel(id, allowReRegister = false)
-                        }
+    private class EmptyModelResponseException : IOException("播放接口暂不可用（空响应）")
+    private class DeviceRegistrationRefusedException(message: String) : IOException(message)
+
+    private fun registerDeviceOrThrowRefusal(): DeviceRegister.Registered? {
+        val device = LinkedHashMap(registerProfile).apply { putAll(deviceIdentity) }
+        val body = DeviceRegister.payload(device)
+        val headers = DeviceRegister.headers(body, device)
+        val result = runCatching {
+            val request = Request.Builder().url(DeviceRegister.url())
+            headers.forEach { (key, value) -> request.header(key, value) }
+            request.post(body.toRequestBody("application/octet-stream".toMediaType()))
+            RequestScope.execute(http.newCall(request.build())) { response ->
+                if (!response.isSuccessful) {
+                    if (response.code in listOf(403, 429)) {
+                        throw DeviceRegistrationRefusedException("设备注册被限制（HTTP ${response.code}）")
                     }
+                    throw IOException("设备注册失败（HTTP ${response.code}）")
                 }
+                val bytes = response.body?.bytes() ?: throw IOException("设备注册响应为空")
+                val raw = String(bytes, Charsets.UTF_8)
+                val json = runCatching { JSONObject(raw) }.getOrNull()
+                if (json != null && json.optInt("code", json.optInt("Code", 0)) != 0) {
+                    throw DeviceRegistrationRefusedException("设备注册被服务端拒绝")
+                }
+                DeviceRegister.parse(raw, response.headers("Set-Cookie"))
+                    ?: throw IOException("设备注册被服务端拒绝")
             }
         }
-        for (host in listOf("https://api5-normal-sinfonlineb.fqnovel.com", "https://api5-normal-lf.fqnovel.com")) {
-            val tabAttempt = runCatching { tabVideoModel(host, id) }
-            val model = tabAttempt.getOrNull()
-            if (model != null) return model
-            val ex = tabAttempt.exceptionOrNull()
-            System.err.println("ContentRepository.tabVideoModel candidate $host failed: ${ex?.javaClass?.name}: ${ex?.message}")
-            if (failure == null) {
-                failure = ex as? IOException ?: IOException(ex?.message ?: "播放接口暂不可用", ex)
-            }
+        val ex = result.exceptionOrNull()
+        if (ex is DeviceRegistrationRefusedException) throw ex
+        val registered = result.getOrNull()
+        if (registered != null) {
+            deviceIdentity = linkedMapOf("device_id" to registered.deviceId, "iid" to registered.installId)
+            registrationCookies = LinkedHashMap(registrationCookies).apply { putAll(registered.cookies) }
+            onDeviceRegistered?.invoke(registered)
         }
-        if (allowReRegister) {
-            System.err.println("ContentRepository.videoModel all candidates failed, attempting registerDevice refresh...")
-            val refreshed = registerDevice()
-            if (refreshed != null) {
-                return videoModel(id, allowReRegister = false)
-            }
-        }
-        throw failure ?: IOException("播放接口暂不可用")
+        return registered
     }
 
-    private fun tabVideoModel(host: String, id: String): JSONObject {
+    internal fun buildPlaybackRequest(
+        id: String,
+        useVideoTab: Boolean,
+        host: String = "https://api5-normal-sinfonlineb.fqnovel.com",
+        stampMs: Long = clock()
+    ): Signer.Request {
+        val khronos = stampMs / 1000L
+        val versionCode = if (useVideoTab) "73932" else "74332"
+        val versionName = if (useVideoTab) "7.3.9.32" else "7.4.3.32"
         val values = LinkedHashMap(deviceProfile()).apply {
             for (key in listOf("version_code", "manifest_version_code", "update_version_code", "pv_player")) {
-                put(key, "73932")
+                put(key, versionCode)
             }
-            put("version_name", "7.3.9.32")
-            put("video_id", id)
-            put("video_id_type", "0")
-            put("device_level", "1")
-            put("need_all_video_definition", "1")
-            put("need_mp4_align", "0")
-            put("use_os_player", "0")
-            put("video_platform", "1024")
-            put("source", "0")
-            put("from_video_id", "")
+            put("version_name", versionName)
+            if (useVideoTab) {
+                put("video_id", id)
+                put("video_id_type", "0")
+                put("device_level", "1")
+                put("need_all_video_definition", "1")
+                put("need_mp4_align", "0")
+                put("use_os_player", "0")
+                put("video_platform", "1024")
+                put("source", "0")
+                put("from_video_id", "")
+            }
+            put("ts", khronos.toString())
+            put("_rticket", stampMs.toString())
         }
-        val signed = signer.sign("$host/reading/bookapi/video_tab/multi_video_model/v1/", values)
-        val ua = VendorConstants.VIDEO_UA.replace("71332", "73932")
-        val request = signed.copy(headers = LinkedHashMap(signed.headers).apply { put("User-Agent", ua) })
+        val bodyBytes = if (useVideoTab) {
+            null
+        } else {
+            val biz = """{"detail_page_version":0,"device_level":3,"disable_digg_stat":false,"need_all_video_definition":true,"need_mp4_align":false,"use_os_player":false,"use_server_dns":false,"video_platform":1024}"""
+            val payload = """{"biz_param":$biz,"mixed_video_id_map":{"1004":["$id"]}}"""
+            PlayerSigner.gzip(payload.toByteArray(Charsets.UTF_8))
+        }
+        val query = PlayerSigner.pythonUrlEncode(values)
+        val path = if (useVideoTab) {
+            "/reading/bookapi/video_tab/multi_video_model/v1/"
+        } else {
+            "/novel/player/multi_video_model/v1/"
+        }
+        val url = "$host$path?$query"
+        val signature = PlayerSigner.signPlayer(query = query, body = bodyBytes, ts = khronos)
+        val aid = values["aid"]?.takeIf { it.isNotBlank() } ?: "8662"
+        val headers = linkedMapOf(
+            "User-Agent" to VendorConstants.VIDEO_UA.replace("71332", versionCode),
+            "Accept" to "application/json; charset=utf-8,application/x-protobuf",
+            "x-ss-req-ticket" to signature.getValue("x-ss-req-ticket"),
+            "sdk-version" to "2",
+            "x-xs-from-web" to "0",
+            "passport-sdk-version" to if (useVideoTab) "50561" else "5051452",
+            "x-ss-dp" to aid,
+            "x-khronos" to signature.getValue("x-khronos"),
+            "x-ladon" to signature.getValue("x-ladon"),
+            "x-argus" to signature.getValue("x-argus"),
+            "x-tt-dt" to "",
+            "x-tt-store-region" to "cn",
+            "x-tt-store-region-src" to "did"
+        )
+        if (bodyBytes != null) {
+            headers["Content-Type"] = "application/json; charset=UTF-8"
+            headers["Content-Encoding"] = "gzip"
+            headers["Connection"] = "close"
+            signature["x-ss-stub"]?.let { headers["x-ss-stub"] = it }
+        } else {
+            headers["x-tt-request-tag"] = "t=0;n=0"
+        }
+        return Signer.Request(url, headers, bodyBytes)
+    }
+
+    private fun executePlaybackCandidate(request: Signer.Request, id: String): JSONObject {
         val response = text(request.url, request)
-        if (response.isBlank()) throw IOException("播放接口暂不可用（空响应）")
+        if (response.isBlank()) throw EmptyModelResponseException()
         val data = JSONObject(response)
         val code = data.optInt("Code", data.optInt("code", 0))
         if (code != 0) throw IOException("播放接口暂不可用（${code}）")
         return videoModelOf(data, id) ?: throw IOException("播放接口暂不可用（没有播放模型）")
+    }
+
+    private fun videoModel(id: String): JSONObject {
+        val primaryHost = "https://api5-normal-sinfonlineb.fqnovel.com"
+        val primaryAttempt = runCatching {
+            val signed = buildPlaybackRequest(id, useVideoTab = true, host = primaryHost)
+            executePlaybackCandidate(signed, id)
+        }
+        primaryAttempt.getOrNull()?.let { return it }
+        val primaryError = primaryAttempt.exceptionOrNull()
+        System.err.println("ContentRepository.videoModel primary video_tab failed: ${primaryError?.javaClass?.name}: ${primaryError?.message}")
+        if (primaryError !is EmptyModelResponseException) {
+            throw (primaryError as? IOException ?: IOException(primaryError?.message ?: "播放接口暂不可用", primaryError))
+        }
+
+        registerDeviceOrThrowRefusal()
+
+        val legacyAttempt = runCatching {
+            val signed = buildPlaybackRequest(id, useVideoTab = false, host = primaryHost)
+            executePlaybackCandidate(signed, id)
+        }
+        legacyAttempt.getOrNull()?.let { return it }
+        val legacyError = legacyAttempt.exceptionOrNull()
+        System.err.println("ContentRepository.videoModel legacy fallback failed: ${legacyError?.javaClass?.name}: ${legacyError?.message}")
+        throw (legacyError as? IOException ?: IOException(legacyError?.message ?: "播放接口暂不可用", legacyError))
     }
 
     private fun videoModelOf(data: JSONObject, expectedId: String = ""): JSONObject? {

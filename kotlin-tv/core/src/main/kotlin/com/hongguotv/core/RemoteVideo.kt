@@ -11,14 +11,18 @@ import java.io.IOException
 class RemoteVideo(private val http: OkHttpClient, val info: StreamInfo): Closeable {
     @Volatile private var closed=false
     private val calls=mutableSetOf<Call>()
+    private val candidateUrls: List<String> = (listOf(info.url) + info.backupUrls)
+        .map { it.trim() }
+        .filter { it.startsWith("http://") || it.startsWith("https://") }
+        .distinct()
+    @Volatile private var activeUrl: String = candidateUrls.firstOrNull() ?: info.url
     data class Range(val bytes: ByteArray,val total: Long)
     var total: Long=0; private set
     private lateinit var prepared: MediaCrypto.Prepared
     @Volatile private var prefix=byteArrayOf()
-    private fun range(start: Long,end: Long): Range {
-        if(closed) throw IOException("播放请求已取消")
-        require(start>=0 && end>=start && end-start<8*1024*1024)
-        val request=Request.Builder().url(info.url).header("User-Agent",info.userAgent).header("Referer",info.referer).header("Range","bytes=$start-$end").header("Accept-Encoding","identity").build()
+
+    private fun fetchRange(targetUrl: String, start: Long, end: Long): Range {
+        val request=Request.Builder().url(targetUrl).header("User-Agent",info.userAgent).header("Referer",info.referer).header("Range","bytes=$start-$end").header("Accept-Encoding","identity").build()
         val call=http.newCall(request)
         synchronized(calls) { if(closed) throw IOException("播放请求已取消"); calls+=call }
         try {
@@ -34,6 +38,26 @@ class RemoteVideo(private val http: OkHttpClient, val info: StreamInfo): Closeab
                 Range(bytes,full)
             }
         } finally { synchronized(calls) { calls-=call } }
+    }
+
+    private fun range(start: Long,end: Long): Range {
+        if(closed) throw IOException("播放请求已取消")
+        require(start>=0 && end>=start && end-start<8*1024*1024)
+        val currentActive = activeUrl
+        val targets = listOf(currentActive) + candidateUrls.filter { it != currentActive }
+        var lastError: IOException? = null
+        for (target in targets) {
+            if (closed) throw IOException("播放请求已取消")
+            try {
+                val res = fetchRange(target, start, end)
+                if (target != activeUrl) activeUrl = target
+                return res
+            } catch (e: IOException) {
+                if (closed) throw e
+                lastError = e
+            }
+        }
+        throw lastError ?: IOException("视频服务器请求失败")
     }
     @Synchronized fun prepare(): RemoteVideo {
         if(closed) throw IOException("播放请求已取消")

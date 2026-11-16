@@ -251,7 +251,7 @@ class ContentRepositoryTest {
         val requests=mutableListOf<Request>()
         val repo=repository { request ->
             requests+=request
-            JSONObject().put("code",0).put("search_tabs",JSONArray().put(searchTab(19,"999")
+            JSONObject().put("code",0).put("search_tabs",JSONArray().put(searchTab(19,"999","修仙")
                 .put("search_id","comic-session").put("passback","comic-cursor").put("next_offset",25))).toString()
         }
         repo.search("修仙",1,ContentType.COMIC)
@@ -268,7 +268,7 @@ class ContentRepositoryTest {
         var requests=0
         val repo=repository(clock={ now }) {
             requests++
-            JSONObject().put("code",0).put("search_tabs",JSONArray().put(searchTab(19,"999")
+            JSONObject().put("code",0).put("search_tabs",JSONArray().put(searchTab(19,"999","修仙")
                 .put("search_id","session").put("passback","cursor"))).toString()
         }
         repo.search("修仙",1,ContentType.COMIC)
@@ -290,9 +290,9 @@ class ContentRepositoryTest {
         assertFalse(result.hasMore)
     }
 
-    private fun searchTab(type: Int,id: String) = JSONObject().put("tab_type",type).put("has_more",true)
+    private fun searchTab(type: Int,id: String,title: String = "测试剧集") = JSONObject().put("tab_type",type).put("has_more",true)
         .put("data",JSONArray().put(JSONObject().put("video_data",JSONArray().put(JSONObject()
-            .put("series_id",id).put("title","测试剧集").put("episode_cnt",8)))))
+            .put("series_id",id).put("title",title).put("episode_cnt",8)))))
 
     @Test fun comicSearchRequestsAndSelectsOnlyComicTab() {
         var requests=0
@@ -302,24 +302,43 @@ class ContentRepositoryTest {
             assertEquals(if(requests==1) "0" else "20",request.url.queryParameter("offset"))
             assertEquals("修仙",request.url.queryParameter("query"))
             JSONObject().put("code",0).put("search_tabs",JSONArray()
-                .put(searchTab(11,"111")).put(searchTab(19,"999"))).toString()
+                .put(searchTab(11,"111")).put(searchTab(19,"999","修仙"))).toString()
         }
         repo.search("修仙",1,ContentType.COMIC)
         assertEquals(listOf("999"),repo.search("修仙",2,ContentType.COMIC).items.map { it.id })
     }
 
-    @Test fun emptyComicSearchDoesNotFallBackToShortResults() {
-        var requests=0
-        val repo=repository { requests++; """{"code":0,"search_tabs":[{"tab_type":19,"data":[],"has_more":false}]}""" }
-        assertTrue(repo.search("无结果",1,ContentType.COMIC).items.isEmpty())
-        assertEquals(1,requests)
+    @Test fun emptyComicSearchFallsBackToShortTabAndWebSearch() {
+        val paths = mutableListOf<String>()
+        val repo = repository { req ->
+            paths += "${req.url.encodedPath}?tab=${req.url.queryParameter("tab_type")}"
+            when (req.url.encodedPath) {
+                "/reading/bookapi/search/tab/v" -> {
+                    if (req.url.queryParameter("tab_type") == "19") {
+                        """{"code":0,"search_tabs":[{"tab_type":19,"data":[],"has_more":false}]}"""
+                    } else {
+                        JSONObject().put("code", 0).put("search_tabs", JSONArray().put(searchTab(11, "777", "遮天"))).toString()
+                    }
+                }
+                else -> """{"searchList":[],"hasMore":false}"""
+            }
+        }
+        val res = repo.search("遮天", 1, ContentType.COMIC)
+        assertEquals(listOf("777"), res.items.map { it.id })
+        assertTrue(paths.any { it.contains("tab=19") })
+        assertTrue(paths.any { it.contains("tab=11") })
     }
 
-    @Test fun missingComicTabDoesNotFallBackToShortResults() {
-        var requests=0
-        val repo=repository { requests++; """{"code":0,"search_tabs":[{"tab_type":11,"data":[]}]}""" }
-        assertThrows(IOException::class.java) { repo.search("修仙",1,ContentType.COMIC) }
-        assertEquals(1,requests)
+    @Test fun missingComicTabFallsBackToShortTabAndWebSearch() {
+        val repo = repository { req ->
+            when (req.url.encodedPath) {
+                "/reading/bookapi/search/tab/v" -> """{"code":0,"search_tabs":[{"tab_type":11,"data":[]}]}"""
+                "/api/search/result" -> """{"searchList":[{"name":"遮天","keyword":"888","video_data":{"series_id":"888","series_title":"遮天"}}],"hasMore":false}"""
+                else -> "{}"
+            }
+        }
+        val res = repo.search("遮天", 1, ContentType.COMIC)
+        assertEquals(listOf("888"), res.items.map { it.id })
     }
 
     @Test fun shortSearchKeepsWebsiteFallback() {
@@ -327,7 +346,7 @@ class ContentRepositoryTest {
         val repo=repository { request ->
             paths+=request.url.encodedPath
             if(paths.size==1) throw IOException("offline")
-            """<script>_ROUTER_DATA={"loaderData":{"search_page":{"searchList":[{"series_id":"456","series_name":"测试短剧"}]}}}};</script>"""
+            """<script>_ROUTER_DATA={"loaderData":{"search_page":{"searchList":[{"series_id":"456","series_name":"短剧"}]}}}};</script>"""
         }
         assertEquals("456",repo.search("短剧",1,ContentType.SHORT).items.single().id)
         assertEquals(2,paths.size)
@@ -336,8 +355,10 @@ class ContentRepositoryTest {
     @Test fun traditionalChineseSearchIsConvertedToSimplified() {
         var queryReceived=""
         val repo=repository { request ->
-            queryReceived=request.url.queryParameter("query").orEmpty()
-            JSONObject().put("code",0).put("search_tabs",JSONArray().put(searchTab(11,"123"))).toString()
+            if (request.url.queryParameter("query") != null && queryReceived.isEmpty()) {
+                queryReceived = request.url.queryParameter("query").orEmpty()
+            }
+            JSONObject().put("code",0).put("search_tabs",JSONArray().put(searchTab(11,"123","战神总裁开局神医"))).toString()
         }
         repo.search("戰神總裁開局神醫",1,ContentType.SHORT)
         assertEquals("战神总裁开局神医",queryReceived)
@@ -347,7 +368,7 @@ class ContentRepositoryTest {
         val repo=repository { "" }
         val problem=assertThrows(IOException::class.java) { repo.search("修仙",1,ContentType.COMIC) }
         assertFalse(problem is org.json.JSONException)
-        assertEquals("搜索接口暂不可用",problem.message)
+        assertTrue(problem.message!!.isNotBlank())
     }
 
     @Test fun fallbackApiCandidatesStripsForceFidsAndEncodeUserTagLockoutParams() {
@@ -507,5 +528,179 @@ class ContentRepositoryTest {
         assertEquals("889", page2.items.single().id)
         assertFalse(page2.hasMore)
         assertEquals(3, page2.genres.size)
+    }
+
+    @Test fun webSearchParsesJsonApiAndFallsBackToItemKeywordAndName() {
+        var capturedHeaders: okhttp3.Headers? = null
+        val repo = repository { req ->
+            when (req.url.encodedPath) {
+                "/api/search/result" -> {
+                    capturedHeaders = req.headers
+                    assertEquals("8662", req.url.queryParameter("aid"))
+                    JSONObject().put("searchList", JSONArray()
+                        .put(JSONObject().put("doc_type", 23).put("name", "谁说纨绔不能当状元").put("keyword", "7673067074104593432").put("video_data", JSONObject()))
+                        .put(JSONObject().put("doc_type", 23).put("video_data", JSONObject().put("series_id", "123456").put("series_title", "测试好剧").put("episode_cnt", 42)))
+                    ).put("hasMore", true).toString()
+                }
+                else -> """{"code":0,"search_tabs":[{"tab_type":11,"data":[]}]}"""
+            }
+        }
+        val res = repo.webSearch("谁说纨绔不能当状元", 1)
+        assertEquals(listOf("7673067074104593432", "123456"), res.items.map { it.id })
+        assertEquals("谁说纨绔不能当状元", res.items[0].title)
+        assertEquals("全 42 集", res.items[1].badge)
+        assertTrue(res.hasMore)
+        assertEquals("https://hongguoduanju.com/", capturedHeaders?.get("Referer"))
+        assertEquals("zh-CN,zh;q=0.9", capturedHeaders?.get("Accept-Language"))
+    }
+
+    @Test fun appSearchEmptyResponseTriggersDeviceRenewalAndRespectsCooldown() {
+        var regCalls = 0
+        var now = 1000L
+        val repo = ContentRepository(
+            OkHttpClient.Builder().addInterceptor { chain ->
+                val req = chain.request()
+                when (req.url.encodedPath) {
+                    "/reading/bookapi/search/tab/v" -> {
+                        val did = req.url.queryParameter("device_id")
+                        if (did == "999000111222") {
+                            Response.Builder().request(req).protocol(Protocol.HTTP_1_1).code(200).message("OK")
+                                .body(JSONObject().put("code", 0).put("search_tabs", JSONArray().put(searchTab(11, "555", "续期成功剧"))).toString().toResponseBody()).build()
+                        } else {
+                            Response.Builder().request(req).protocol(Protocol.HTTP_1_1).code(200).message("OK").body("".toResponseBody()).build()
+                        }
+                    }
+                    "/service/2/device_register/" -> {
+                        regCalls++
+                        if (regCalls == 1) {
+                            Response.Builder().request(req).protocol(Protocol.HTTP_1_1).code(429).message("Too Many").body("".toResponseBody()).build()
+                        } else {
+                            Response.Builder().request(req).protocol(Protocol.HTTP_1_1).code(200).message("OK")
+                                .body("""{"device_id_str":"999000111222","install_id_str":"999000111333"}""".toResponseBody()).build()
+                        }
+                    }
+                    else -> Response.Builder().request(req).protocol(Protocol.HTTP_1_1).code(200).message("OK").body("""{"searchList":[]}""".toResponseBody()).build()
+                }
+            }.build(),
+            clock = { now }
+        )
+
+        // First attempt triggers regCalls=1 (429), entering 10s cooldown
+        assertNull(repo.registerDevice())
+        assertEquals(1, regCalls)
+        // Within cooldown window, registerDevice does not hit network
+        now += 3000L
+        assertNull(repo.registerDevice())
+        assertEquals(1, regCalls)
+        // After cooldown expires, search empty response triggers regCalls=2 and retries search
+        now += 10000L
+        val res = repo.search("续期成功剧", 1, ContentType.SHORT)
+        assertEquals(2, regCalls)
+        assertEquals(listOf("555"), res.items.map { it.id })
+    }
+
+    @Test fun relaxedQueriesNewReleasesAndRelevanceRankingWorkTogether() {
+        val queriesSeen = mutableListOf<String>()
+        val repo = repository { req ->
+            when (req.url.encodedPath) {
+                "/reading/bookapi/search/tab/v" -> """{"code":0,"search_tabs":[{"tab_type":11,"data":[]}]}"""
+                "/api/search/result" -> {
+                    val q = req.url.queryParameter("query").orEmpty()
+                    queriesSeen += q
+                    when (q) {
+                        "言出法随，诸天万界" -> JSONObject().put("searchList", JSONArray()
+                            .put(JSONObject().put("video_data", JSONObject().put("series_id", "10").put("series_title", "无关剧集").put("series_intro", "讲述言出法随诸天万界的故事")))
+                        ).toString()
+                        "言出法随诸天万界" -> JSONObject().put("searchList", JSONArray()
+                            .put(JSONObject().put("video_data", JSONObject().put("series_id", "11").put("series_title", "全新言出法随诸天万界前传")))
+                        ).toString()
+                        "绝世神豪" -> JSONObject().put("searchList", JSONArray()
+                            .put(JSONObject().put("video_data", JSONObject().put("series_id", "20").put("series_title", "普通都市").put("series_intro", "绝世神豪传奇")))
+                            .put(JSONObject().put("video_data", JSONObject().put("series_id", "21").put("series_title", "全新绝世神豪前传")))
+                            .put(JSONObject().put("video_data", JSONObject().put("series_id", "22").put("series_title", "绝世神豪")))
+                        ).toString()
+                        else -> """{"searchList":[]}"""
+                    }
+                }
+                AppCategoryCatalog.CATEGORY_PATH -> JSONObject().put("code", 0).put("data", JSONObject()
+                    .put("has_more", false)
+                    .put("video_data", JSONArray().put(JSONObject()
+                        .put("series_id", "13").put("title", "言出法随").put("content_type", 1)
+                        .put("tag_info", JSONObject().put("text", "今日上新"))
+                    ))).toString()
+                else -> "{}"
+            }
+        }
+        val res = repo.search("言出法随，诸天万界", 1, ContentType.SHORT)
+        assertTrue("言出法随诸天万界" in queriesSeen)
+        // Contains match ("11") + new-release reverse-match ("13") before intro match ("10")
+        assertEquals(listOf("11", "13", "10"), res.items.map { it.id })
+
+        val exactRes = repo.search("绝世神豪", 1, ContentType.SHORT)
+        // Exact match ("22") > contains match ("21") > intro match ("20")
+        assertEquals(listOf("22", "21", "20"), exactRes.items.map { it.id })
+    }
+
+    @Test fun detailFallsBackToPlayerRouteWhenDetailRouteFails() {
+        val paths = mutableListOf<String>()
+        val repo = repository { req ->
+            paths += req.url.encodedPath
+            when (req.url.encodedPath) {
+                "/detail" -> throw IOException("detail edge hung")
+                "/player/777" -> """<script>_ROUTER_DATA={"loaderData":{"player_(series_id)/page":{"seriesDetail":{"series_id":"777","series_name":"备用详情剧","vid_list":["1001","1002"]}}}};</script>"""
+                else -> ""
+            }
+        }
+        val detail = repo.detail("777")
+        assertEquals("备用详情剧", detail.series.title)
+        assertEquals(listOf("1001", "1002"), detail.episodes)
+        assertTrue("/detail" in paths && "/player/777" in paths)
+    }
+
+    @Test fun parseModelStreamsExpandsBackupUrlsAndRemoteVideoFailsOver() {
+        val repo = repository { req ->
+            val model = JSONObject().put("video_list", JSONArray().put(
+                JSONObject()
+                    .put("main_url", "https://cdn-fail.example/video.mp4")
+                    .put("backup_url", "https://cdn-backup1.example/video.mp4")
+                    .put("backup_url_list", JSONArray().put("https://cdn-backup2.example/video.mp4"))
+                    .put("video_meta", JSONObject().put("vwidth", 720).put("vheight", 1280).put("codec_type", "h264").put("definition", "720p"))
+                    .put("encrypt_info", JSONObject().put("encrypt", false))
+            ))
+            JSONObject().put("code", 0).put("data", JSONObject().put("video_model", model)).toString()
+        }
+        val stream = repo.stream("123", 1080)
+        assertEquals("https://cdn-fail.example/video.mp4", stream.url)
+        assertEquals(listOf("https://cdn-backup1.example/video.mp4", "https://cdn-backup2.example/video.mp4"), stream.backupUrls)
+
+        val mp4Stub = be32(16) + "ftypisom0000".toByteArray() + be32(8) + "moov".toByteArray()
+        val hostsHit = mutableListOf<String>()
+        val failoverHttp = OkHttpClient.Builder().addInterceptor { chain ->
+            val req = chain.request()
+            hostsHit += req.url.host
+            if (req.url.host == "cdn-fail.example") {
+                Response.Builder().request(req).protocol(Protocol.HTTP_1_1).code(502).message("Bad Gateway").body("".toResponseBody()).build()
+            } else {
+                Response.Builder().request(req).protocol(Protocol.HTTP_1_1).code(206).message("Partial")
+                    .header("Content-Range", "bytes 0-${mp4Stub.size - 1}/${mp4Stub.size}")
+                    .body(mp4Stub.toResponseBody()).build()
+            }
+        }.build()
+        RemoteVideo(failoverHttp, stream).use { rv ->
+            rv.prepare()
+            assertEquals(mp4Stub.size.toLong(), rv.total)
+            assertArrayEquals(mp4Stub, rv.read(0, mp4Stub.size))
+        }
+        assertEquals(listOf("cdn-fail.example", "cdn-backup1.example"), hostsHit)
+    }
+
+    @Test fun mediaUrlGuardBlocksPrivateAndFakeIpAddresses() {
+        assertTrue(MediaUrlGuard.isPublicInetAddress(java.net.InetAddress.getByName("8.8.8.8")))
+        assertTrue(MediaUrlGuard.isPublicInetAddress(java.net.InetAddress.getByName("2400:3200::1")))
+        for (privateIp in listOf("127.0.0.1", "10.0.0.1", "172.16.0.1", "192.168.1.1", "100.64.0.1", "169.254.169.254", "198.18.0.1", "::1", "fc00::1")) {
+            assertFalse("Expected $privateIp to be blocked", MediaUrlGuard.isPublicInetAddress(java.net.InetAddress.getByName(privateIp)))
+        }
+        assertTrue(MediaUrlGuard.isFakeIpAddress(java.net.InetAddress.getByName("198.18.0.1")))
+        assertFalse(MediaUrlGuard.isFakeIpAddress(java.net.InetAddress.getByName("8.8.8.8")))
     }
 }

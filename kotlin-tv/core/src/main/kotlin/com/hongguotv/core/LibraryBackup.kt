@@ -34,7 +34,7 @@ data class BackupData(val favorites: List<Series>,val history: List<BackupProgre
 
 object LibraryBackup {
     const val MAX_BYTES=2*1024*1024
-    internal val idPattern=Regex("^(?:[0-9]{1,30}|xifan:[a-zA-Z0-9_-]{1,32}:[a-zA-Z0-9_-]{1,96}(?::[a-zA-Z0-9_-]{1,96})?|hema:[0-9]{1,30}(?::[0-9]{1,30})?|dramabox:[0-9]{1,24}(?::[0-9]{1,24})?|reelshort:[a-zA-Z0-9_]{1,100}:[a-z0-9-]{1,200}(?::[1-9][0-9]{0,3}:[a-zA-Z0-9_]{1,100})?)$")
+    internal val idPattern=Regex("^(?:[0-9]{1,30}|xifan:[a-zA-Z0-9_-]{1,64}:[a-zA-Z0-9_-]{1,120}(?::[a-zA-Z0-9_-]{1,120})?|hema:[0-9]{1,30}(?::[0-9]{1,30})?|dramabox:[0-9]{1,24}(?::[0-9]{1,24})?|reelshort:[a-zA-Z0-9_]{1,100}:[a-z0-9-]{1,200}(?::[1-9][0-9]{0,3}:[a-zA-Z0-9_]{1,100})?)$")
     private fun id(value: String)=value.also { require(idPattern.matches(it)) { "剧集标识无效" } }
     private fun cleanCover(value: String): String=runCatching {
         val uri=URI(value); val host=uri.host.orEmpty().lowercase()

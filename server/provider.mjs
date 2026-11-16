@@ -29,6 +29,8 @@ vm.runInContext(
 );
 const api = context.api;
 const SITE = "https://hongguoduanju.com";
+const WEB_UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36";
 const card = (row) => ({
   id: String(row.url),
   title: row.title,
@@ -42,6 +44,56 @@ const cards = (rows) =>
     .filter((r) => /^\d+$/.test(String(r.url)) && r.title)
     .map(card);
 
+async function webApiSearch(keyword, page) {
+  try {
+    const res = await axios.get(`${SITE}/api/search/result`, {
+      params: { aid: "8662", query: keyword, page },
+      headers: {
+        "User-Agent": WEB_UA,
+        Accept: "application/json, text/plain, */*",
+        "Accept-Language": "zh-CN,zh;q=0.9",
+        Referer: `${SITE}/`,
+      },
+      timeout: 10000,
+      maxContentLength: 8 * 1024 * 1024,
+    });
+    const payload = res?.data;
+    if (payload && typeof payload.code === "string") {
+      throw new Error(payload.message || payload.code);
+    }
+    if (!Array.isArray(payload?.searchList)) {
+      throw new Error("官网搜索数据格式异常");
+    }
+    const mapped = payload.searchList.map((item) => {
+      const hasVideo =
+        item?.video_data &&
+        typeof item.video_data === "object" &&
+        Object.keys(item.video_data).length > 0;
+      const base = hasVideo ? api.itemToCard(item) : null;
+      const id = String(base?.url || item?.series_id || item?.keyword || "").trim();
+      const title = String(base?.title || item?.name || "").trim();
+      return {
+        url: id,
+        title,
+        img: base?.img || "",
+        desc: base?.desc || "",
+        tname: base?.tname || "",
+        content: base?.content || "",
+      };
+    });
+    return cards(mapped);
+  } catch (apiError) {
+    const data = await api.routerData(
+      `${SITE}/search/${encodeURIComponent(keyword)}?page=${page}`
+    );
+    const pageData =
+      data?.loaderData?.["search_(keyword)/page"] ||
+      data?.loaderData?.search_page;
+    if (!Array.isArray(pageData?.searchList)) throw apiError;
+    return cards(pageData.searchList.map(api.itemToCard));
+  }
+}
+
 export const provider = {
   async home(page = 1) {
     const data = await api.categoryPage("tab=1&sort_type=1", page);
@@ -52,20 +104,28 @@ export const provider = {
     return { items: cards(pageData.recommendList.map(api.itemToCard)), page };
   },
   async search(keyword, page = 1) {
+    let webItems = null;
+    let appItems = null;
+    let lastError = null;
+    try {
+      webItems = await webApiSearch(keyword, page);
+    } catch (error) {
+      lastError = error;
+    }
     try {
       const result = await api.appSearchPage(keyword, 11, page, 20);
-      if (result.list.length) return { items: cards(result.list), page };
-    } catch {
-      /* Website fallback; failure below remains an error, never an empty success. */
+      appItems = cards(result.list || []);
+    } catch (error) {
+      lastError = lastError || error;
     }
-    const data = await api.routerData(
-      `${SITE}/search/${encodeURIComponent(keyword)}?page=${page}`
-    );
-    const pageData =
-      data?.loaderData?.["search_(keyword)/page"] ||
-      data?.loaderData?.search_page;
-    if (!Array.isArray(pageData?.searchList)) throw new Error("搜索数据不可用");
-    return { items: cards(pageData.searchList.map(api.itemToCard)), page };
+    if (webItems === null && appItems === null) {
+      throw lastError || new Error("搜索数据不可用");
+    }
+    const merged = new Map();
+    for (const item of [...(webItems || []), ...(appItems || [])]) {
+      if (!merged.has(item.id)) merged.set(item.id, item);
+    }
+    return { items: [...merged.values()], page };
   },
   async detail(id) {
     const data = await api.routerData(`${SITE}/detail?series_id=${id}`);

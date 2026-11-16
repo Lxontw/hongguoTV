@@ -483,9 +483,9 @@ class MainActivity: Activity() {
             }
             nav.forEach { it.nextFocusDownId=typeButtons.getValue(library.contentType).id }
         }
-        if(tab==0 && collection==null && library.mediaSource in setOf(MediaSource.HONGGUO,MediaSource.XIFAN)) {
-            val genres=if(availableGenres.isNotEmpty()) availableGenres else if(library.mediaSource==MediaSource.XIFAN) {
-                listOf(GenreFilter("","全部推荐"),GenreFilter(AppCategoryCatalog.NEW_TODAY_ID,"今日上新"))
+        if(tab==0 && collection==null && library.mediaSource in setOf(MediaSource.HONGGUO,MediaSource.XIFAN,MediaSource.HEMA)) {
+            val genres=if(availableGenres.isNotEmpty()) availableGenres else if(library.mediaSource in setOf(MediaSource.XIFAN,MediaSource.HEMA)) {
+                listOf(GenreFilter("","全部推荐"))
             } else repository.defaultGenres(library.contentType)
             val genreScroll=HorizontalScrollView(this).apply {
                 isVerticalScrollBarEnabled=false

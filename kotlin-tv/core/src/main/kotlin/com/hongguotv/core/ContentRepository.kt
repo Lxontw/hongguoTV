@@ -52,21 +52,35 @@ data class Detail(val series: Series, val episodes: List<String>)
 data class RankPosition(val rank: Int?, val heat: String)
 data class ComicRanking(val positions: Map<String,RankPosition>, val totalPages: Int, val updatedText: String)
 data class CatalogPage(val items: List<Series>, val hasMore: Boolean, val ranking: ComicRanking? = null, val genres: List<GenreFilter> = emptyList())
-data class StreamInfo(val url: String, val key: ByteArray?, val quality: String, val width: Int = 0, val height: Int = 0, val referer: String = "https://novel.snssdk.com/", val userAgent: String = VendorConstants.VIDEO_UA, val hls: Boolean = false)
+data class StreamInfo(val url: String, val key: ByteArray?, val quality: String, val width: Int = 0, val height: Int = 0, val referer: String = "https://novel.snssdk.com/", val userAgent: String = VendorConstants.VIDEO_UA, val hls: Boolean = false, val backupUrls: List<String> = emptyList())
 class SearchSessionExpiredException: IOException("搜索结果已过期，请从第 1 页重新搜索")
 
-class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectTimeout(15,TimeUnit.SECONDS).readTimeout(30,TimeUnit.SECONDS).callTimeout(45,TimeUnit.SECONDS).build(), private val clock: () -> Long = System::currentTimeMillis) {
+class ContentRepository(
+    val http: OkHttpClient = OkHttpClient.Builder()
+        .dns(MediaUrlGuard.PublicDns)
+        .connectTimeout(15,TimeUnit.SECONDS)
+        .readTimeout(30,TimeUnit.SECONDS)
+        .callTimeout(45,TimeUnit.SECONDS)
+        .build(),
+    private val clock: () -> Long = System::currentTimeMillis
+) {
     private val signer = Signer(clock)
     private val site = "https://hongguoduanju.com"
     private val xifan = XifanRepository(http)
     private val hema = HemaRepository(http)
     private val reelshort = OverseasRepository(http, MediaSource.REELSHORT)
     private val dramabox = OverseasRepository(http, MediaSource.DRAMABOX)
-    private data class SearchCursor(val searchId: String, val passback: String, val offset: Int?, val updatedAt: Long)
+    private data class SearchCursor(val searchId: String, val passback: String, val offset: Int?, val updatedAt: Long, val channel: String = "app")
     private val searchCursors=linkedMapOf<Triple<ContentType,String,Int>,SearchCursor>()
     private data class CategoryCursor(val offset: Int, val sessionId: String, val genres: List<GenreFilter>, val updatedAt: Long)
     private val categoryCursors=linkedMapOf<Triple<ContentType,String,Int>,CategoryCursor>()
     private val genreCache=java.util.concurrent.ConcurrentHashMap<ContentType,Pair<Long,List<GenreFilter>>>()
+    private val newReleaseCacheLock = Any()
+    @Volatile private var newReleaseCache: Pair<Long, List<Series>>? = null
+    private val registrationBackoffMs = listOf(10_000L, 15_000L, 30_000L, 60_000L, 120_000L, 300_000L)
+    private val registrationCooldownLock = Any()
+    @Volatile private var registrationCooldownUntil = 0L
+    @Volatile private var registrationFailures = 0
 
     @Volatile var deviceIdentity: Map<String,String> = emptyMap()
         set(value) { field=value.filterValues { it.isNotBlank() }; signer.updateDevice(deviceProfile()) }
@@ -79,28 +93,60 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
     @Volatile var registerProfile: Map<String,String> = emptyMap()
     @Volatile var onDeviceRegistered: ((DeviceRegister.Registered) -> Unit)? = null
 
-    fun registerDevice(): DeviceRegister.Registered? {
+    private fun executeDeviceRegistration(throwOnRefusal: Boolean): DeviceRegister.Registered? {
+        synchronized(registrationCooldownLock) {
+            val now = clock()
+            if (now < registrationCooldownUntil) {
+                if (throwOnRefusal) throw DeviceRegistrationRefusedException("设备注册冷却中，请稍后重试")
+                return null
+            }
+        }
         val device=LinkedHashMap(registerProfile).apply { putAll(deviceIdentity) }
         val body=DeviceRegister.payload(device)
         val headers=DeviceRegister.headers(body,device)
-        val registered=runCatching {
+        val result=runCatching {
             val request=Request.Builder().url(DeviceRegister.url())
             headers.forEach { (key,value) -> request.header(key,value) }
             request.post(body.toRequestBody("application/octet-stream".toMediaType()))
             RequestScope.execute(http.newCall(request.build())) { response ->
-                if(!response.isSuccessful) throw IOException("设备注册失败（HTTP ${response.code}）")
+                if(!response.isSuccessful) {
+                    if (response.code in listOf(403, 429)) {
+                        throw DeviceRegistrationRefusedException("设备注册被限制（HTTP ${response.code}）")
+                    }
+                    throw IOException("设备注册失败（HTTP ${response.code}）")
+                }
                 val bytes=response.body?.bytes() ?: throw IOException("设备注册响应为空")
-                DeviceRegister.parse(String(bytes,Charsets.UTF_8),response.headers("Set-Cookie"))
+                val raw = String(bytes,Charsets.UTF_8)
+                val json = runCatching { JSONObject(raw) }.getOrNull()
+                if (json != null && json.optInt("code", json.optInt("Code", 0)) != 0) {
+                    throw DeviceRegistrationRefusedException("设备注册被服务端拒绝")
+                }
+                DeviceRegister.parse(raw,response.headers("Set-Cookie"))
                     ?: throw IOException("设备注册被服务端拒绝")
             }
-        }.getOrNull()
+        }
+        val registered = result.getOrNull()
         if(registered!=null) {
+            synchronized(registrationCooldownLock) {
+                registrationFailures = 0
+                registrationCooldownUntil = 0L
+            }
             deviceIdentity=linkedMapOf("device_id" to registered.deviceId,"iid" to registered.installId)
             registrationCookies=LinkedHashMap(registrationCookies).apply { putAll(registered.cookies) }
             onDeviceRegistered?.invoke(registered)
+            return registered
         }
-        return registered
+        synchronized(registrationCooldownLock) {
+            val delayMs = registrationBackoffMs[registrationFailures.coerceAtMost(registrationBackoffMs.lastIndex)]
+            registrationFailures++
+            registrationCooldownUntil = clock() + delayMs
+        }
+        val ex = result.exceptionOrNull()
+        if (throwOnRefusal && ex is DeviceRegistrationRefusedException) throw ex
+        return null
     }
+
+    fun registerDevice(): DeviceRegister.Registered? = executeDeviceRegistration(throwOnRefusal = false)
 
     @Volatile var registrationCookies: Map<String,String> = emptyMap()
         set(value) { field=LinkedHashMap(value) }
@@ -110,7 +156,7 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
             putAll(deviceIdentity)
         }
     private val rankCache = java.util.concurrent.ConcurrentHashMap<Int, Pair<Long, CatalogPage>>()
-    private fun text(url: String, signed: Signer.Request? = null): String {
+    private fun text(url: String, signed: Signer.Request? = null, extraHeaders: Map<String, String> = emptyMap()): String {
         val isWeb = url.startsWith(site)
         val defaultUa = if (isWeb) VendorConstants.WEB_UA else VendorConstants.VIDEO_UA
         val maxAttempts = if (isWeb && signed == null) 3 else 1
@@ -120,6 +166,7 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
             try {
                 val request = Request.Builder().url(url).header("User-Agent", defaultUa)
                 if (isWeb) request.header("Connection", "close")
+                extraHeaders.forEach { (k, v) -> request.header(k, v) }
                 signed?.headers?.forEach { (k, v) -> request.header(k, v) }
                 signed?.body?.let { request.post(it.toRequestBody("application/json; charset=utf-8".toMediaType())) }
 
@@ -156,7 +203,7 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
     }
     private fun router(url: String) = extractRouter(text(url)).getJSONObject("loaderData")
     private fun card(item: JSONObject): Series {
-        val o=item.optJSONObject("video_data") ?: item
+        val o=item.optJSONObject("video_data")?.takeIf { it.length() > 0 } ?: item
         val count=o.optInt("episode_cnt",o.optJSONObject("series_episode_info")?.optInt("episode_cnt",0) ?: 0)
         val tags=o.optJSONArray("tags") ?: o.optJSONArray("category_list") ?: JSONArray()
         val vertical = if(o.has("vertical")) o.optBoolean("vertical") else null
@@ -164,11 +211,13 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
         val detailObj = o.optJSONObject("video_detail")
         val aiUsage = o.optInt("ai_usage_type", detailObj?.optInt("ai_usage_type", 0) ?: 0)
         val isAi = if(aiUsage > 0) true else null
+        val id = o.str("series_id").ifEmpty { item.str("series_id").ifEmpty { item.str("keyword") } }
+        val title = cleanSearchTitle(o.str("series_name").ifEmpty { o.str("series_title").ifEmpty { item.str("name").ifEmpty { o.str("title") } } })
         return Series(
-            o.str("series_id"),
-            o.str("series_name").ifEmpty { o.str("series_title").ifEmpty { item.str("name") } },
-            normalizeCoverUrl(o.str("series_cover")),
-            o.str("series_intro"),
+            id,
+            title,
+            normalizeCoverUrl(o.str("series_cover").ifEmpty { o.str("cover") }),
+            cleanSearchTitle(o.str("series_intro")),
             o.str("episode_right_text").ifEmpty { if(count>0) "全 ${count} 集" else "" },
             (0 until minOf(tags.length(),5)).joinToString(" · ") { tags.optJSONObject(it)?.str("name") ?: tags.optString(it) },
             isAi = isAi,
@@ -252,7 +301,7 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
         require(page in 1..100)
         when (source) {
             MediaSource.XIFAN -> return xifan.home(page, genreId)
-            MediaSource.HEMA -> return hema.home(page)
+            MediaSource.HEMA -> return hema.home(page, genreId)
             MediaSource.REELSHORT -> return reelshort.home(page)
             MediaSource.DRAMABOX -> return dramabox.home(page)
             MediaSource.HONGGUO -> {}
@@ -271,6 +320,186 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
         val lastPage=section.optJSONObject("pagination")?.optInt("totalPages",100) ?: 100
         return CatalogPage(items,items.isNotEmpty() && page<minOf(lastPage,100), genres = defaultGenres(type))
     }
+
+    internal fun cleanSearchTitle(value: String): String = value
+        .replace(Regex("<[^>]*>"), "")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&#039;", "'")
+        .replace(Regex("\\s+"), " ")
+        .trim()
+
+    internal fun normalizeSearchText(value: String): String =
+        java.text.Normalizer.normalize(value, java.text.Normalizer.Form.NFKC)
+            .lowercase(java.util.Locale.ROOT)
+            .replace(Regex("[\\s\\p{P}\\p{S}]+"), "")
+
+    internal fun relaxedSearchQueries(keyword: String): List<String> {
+        val text = java.text.Normalizer.normalize(keyword, java.text.Normalizer.Form.NFKC).trim()
+        val stripped = text.replace(Regex("[\\s\\p{P}\\p{S}]+"), "")
+        val candidates = mutableListOf<String>()
+        if (stripped.isNotEmpty() && stripped != text) candidates += stripped
+        val firstClause = text.split(Regex("[\\s\\p{P}\\p{S}]+"))
+            .map { it.trim() }
+            .firstOrNull { it.length >= 2 }
+        if (firstClause != null && firstClause != text && firstClause !in candidates) {
+            candidates += firstClause
+        }
+        return candidates.take(2)
+    }
+
+    internal fun rankSearchResults(items: List<Series>, keyword: String, newReleaseIds: Set<String> = emptySet()): List<Series> {
+        val queryNorm = normalizeSearchText(keyword)
+        val deduped = mergeSeries(items, emptyList())
+        if (queryNorm.isEmpty()) return deduped
+        fun relevance(series: Series): Int {
+            val titleNorm = normalizeSearchText(series.title)
+            if (titleNorm == queryNorm) return 0
+            if (titleNorm.contains(queryNorm)) return 1
+            if (series.id in newReleaseIds && titleNorm.length >= 2 && queryNorm.contains(titleNorm)) return 1
+            if (normalizeSearchText(series.description).contains(queryNorm)) return 2
+            return 3
+        }
+        return deduped.sortedBy(::relevance)
+    }
+
+    private fun hasTitleMatch(items: List<Series>, keyword: String): Boolean {
+        val q = normalizeSearchText(keyword)
+        return q.isNotEmpty() && items.any { normalizeSearchText(it.title).contains(q) }
+    }
+
+    private fun hasExactTitleMatch(items: List<Series>, keyword: String): Boolean {
+        val q = normalizeSearchText(keyword)
+        return q.isNotEmpty() && items.any { normalizeSearchText(it.title) == q }
+    }
+
+    private fun mergeSeries(primary: List<Series>, secondary: List<Series>): List<Series> {
+        val map = linkedMapOf<String, Series>()
+        for (item in primary + secondary) {
+            val existing = map[item.id]
+            if (existing == null) {
+                map[item.id] = item
+            } else {
+                map[item.id] = existing.copy(
+                    cover = existing.cover.ifBlank { item.cover },
+                    description = existing.description.ifBlank { item.description },
+                    badge = existing.badge.ifBlank { item.badge },
+                    tags = existing.tags.ifBlank { item.tags },
+                    isAi = existing.isAi ?: item.isAi,
+                    isLandscape = existing.isLandscape ?: item.isLandscape
+                )
+            }
+        }
+        return map.values.toList()
+    }
+
+    internal fun webSearch(query: String, page: Int): CatalogPage {
+        val headers = mapOf(
+            "Accept" to "application/json, text/plain, */*",
+            "Accept-Language" to "zh-CN,zh;q=0.9",
+            "Referer" to "$site/"
+        )
+        val raw = text("$site/api/search/result?aid=8662&query=${Signer.encode(query)}&page=$page", extraHeaders = headers).trim()
+        if (raw.startsWith("{")) {
+            val json = JSONObject(raw)
+            if (json.opt("code") is String) {
+                val msg = json.str("message").ifEmpty { json.str("code") }
+                throw IOException("官网搜索暂不可用（$msg）")
+            }
+            val rows = json.optJSONArray("searchList") ?: throw IOException("官网搜索数据格式异常")
+            val items = valid(rows.objects().map(::card))
+            if (rows.length() > 0 && items.isEmpty()) throw IOException("官网搜索条目无法识别")
+            val hasMore = json.optBoolean("hasMore", false) && page < 100
+            return CatalogPage(items, hasMore)
+        }
+        val data = extractRouter(raw).getJSONObject("loaderData")
+        val section = data.optJSONObject("search_(keyword)/page")
+            ?: data.optJSONObject("search_page")
+            ?: throw IOException("官网搜索页面缺少数据")
+        val rows = section.optJSONArray("searchList") ?: throw IOException("官网搜索数据缺失")
+        val items = valid(rows.objects().map(::card))
+        return CatalogPage(items, items.isNotEmpty() && page < 100)
+    }
+
+    private fun loadNewReleasePool(): List<Series> {
+        val now = clock()
+        synchronized(newReleaseCacheLock) {
+            newReleaseCache?.takeIf { now - it.first < 60_000L }?.let { return it.second }
+        }
+        val values = LinkedHashMap(deviceProfile())
+        for (k in listOf("version_code", "manifest_version_code", "update_version_code", "pv_player")) values[k] = "73532"
+        values["version_name"] = "7.3.5.32"
+        val configs = listOf(
+            Triple("default", "short_play", ContentType.SHORT),
+            Triple("ai_series", "ai_series", ContentType.SHORT),
+            Triple("comic_series", "comic_series", ContentType.COMIC)
+        )
+        val hosts = listOf("https://api5-normal-lf.fqnovel.com", "https://api5-normal-lq.fqnovel.com")
+        val collected = mutableListOf<Series>()
+        for ((reqScene, genre, cType) in configs) {
+            val basePayload = AppCategoryCatalog.buildPayload(cType, AppCategoryCatalog.NEW_TODAY_ID, 0, "", 1)
+            basePayload.put("req_scene", reqScene)
+            basePayload.getJSONObject("select_items").put("genre", JSONArray().put(genre))
+            val payloadBytes = basePayload.toString().toByteArray(Charsets.UTF_8)
+            for (host in hosts) {
+                val parsed = runCatching {
+                    val signed = signer.sign(host + AppCategoryCatalog.CATEGORY_PATH, values, payloadBytes)
+                    AppCategoryCatalog.parseResponse(text(signed.url, signed), cType, 0, emptyList())
+                }.getOrNull()
+                if (parsed != null) {
+                    collected += parsed.items
+                    break
+                }
+            }
+        }
+        val merged = mergeSeries(collected, emptyList())
+        if (merged.isNotEmpty()) {
+            synchronized(newReleaseCacheLock) {
+                newReleaseCache = now to merged
+            }
+        }
+        return merged
+    }
+
+    internal fun searchNewReleases(query: String): List<Series> {
+        val queryNorm = normalizeSearchText(query)
+        if (queryNorm.length < 2) return emptyList()
+        val pool = runCatching { loadNewReleasePool() }.getOrDefault(emptyList())
+        val scored = mutableListOf<Pair<Int, Series>>()
+        for (item in pool) {
+            val titleNorm = normalizeSearchText(item.title)
+            if (titleNorm.isEmpty()) continue
+            val score = when {
+                titleNorm == queryNorm -> 0
+                titleNorm.contains(queryNorm) -> 1
+                titleNorm.length >= 2 && queryNorm.contains(titleNorm) -> 2
+                else -> -1
+            }
+            if (score >= 0) scored += score to item
+        }
+        return scored.sortedWith(compareBy<Pair<Int, Series>> { it.first }
+            .thenByDescending { it.second.badge.contains("今日上新") })
+            .map { it.second }
+            .take(20)
+    }
+
+    private fun getSearchCursor(type: ContentType, keyword: String, page: Int): SearchCursor? =
+        synchronized(searchCursors) {
+            val now = clock()
+            searchCursors.entries.removeAll { now - it.value.updatedAt > 300_000L || (page == 1 && it.key.first == type && it.key.second == keyword) }
+            searchCursors[Triple(type, keyword, page - 1)]
+        }
+
+    private fun saveSearchCursor(type: ContentType, keyword: String, page: Int, cursor: SearchCursor) {
+        synchronized(searchCursors) {
+            searchCursors[Triple(type, keyword, page)] = cursor
+            while (searchCursors.size > 100) searchCursors.remove(searchCursors.keys.first())
+        }
+    }
+
     fun search(keyword: String, page: Int = 1, type: ContentType = ContentType.SHORT, source: MediaSource = MediaSource.HONGGUO): CatalogPage {
         require(keyword.isNotBlank() && keyword.length<=80 && page in 1..100)
         val normalized = ChineseConverter.toSimplified(keyword).trim()
@@ -282,24 +511,65 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
             MediaSource.DRAMABOX -> return dramabox.search(query, page)
             MediaSource.HONGGUO -> {}
         }
-        // The website search does not constrain content type. Never use it for comics.
-        if(type==ContentType.COMIC) return appSearch(query,page,type)
-        try {
-            val result = appSearch(query, page, type)
-            if (result.items.isNotEmpty() || !result.hasMore) return result
-        } catch (e: Exception) {
-            if (e is SearchSessionExpiredException) throw e
-            /* Website fallback for short dramas only. */
+        if (page > 1) {
+            val cursor = getSearchCursor(type, query, page)
+            if (cursor?.channel == "web") {
+                val webRes = webSearch(query, page)
+                if (webRes.hasMore) saveSearchCursor(type, query, page, SearchCursor("", "", null, clock(), "web"))
+                return webRes
+            }
+            if (cursor == null && type == ContentType.COMIC) throw SearchSessionExpiredException()
+            val appAttempt = runCatching { appSearchWithRenewal(query, page, type) }
+            appAttempt.getOrNull()?.let { return it }
+            val ex = appAttempt.exceptionOrNull()
+            if (ex is SearchSessionExpiredException) throw ex
+            return webSearch(query, page)
         }
-        val data = try {
-            router("$site/search/${Signer.encode(query)}?page=$page")
-        } catch(e: Exception) {
-            return CatalogPage(emptyList(), false)
+
+        val appAttempt = runCatching { appSearchWithRenewal(query, 1, type) }
+        val appResult = appAttempt.getOrNull()
+        val appError = appAttempt.exceptionOrNull()
+        val appItems = appResult?.items.orEmpty()
+
+        var webResult: CatalogPage? = null
+        var webError: Throwable? = null
+        if (appResult == null || appItems.isEmpty() || !hasExactTitleMatch(appItems, query)) {
+            val webAttempt = runCatching { webSearch(query, 1) }
+            webResult = webAttempt.getOrNull()
+            webError = webAttempt.exceptionOrNull()
         }
-        val section = data.optJSONObject("search_(keyword)/page") ?: data.optJSONObject("search_page") ?: return CatalogPage(emptyList(), false)
-        val rows = section.optJSONArray("searchList") ?: return CatalogPage(emptyList(), false)
-        val items = valid(rows.objects().map(::card))
-        return CatalogPage(items, items.isNotEmpty() && page < 100)
+
+        if (appResult == null && webResult == null) {
+            throw (webError as? IOException
+                ?: appError as? IOException
+                ?: IOException(webError?.message ?: appError?.message ?: "搜索暂不可用"))
+        }
+
+        var combined = mergeSeries(webResult?.items.orEmpty(), appItems)
+
+        if (!hasTitleMatch(combined, query)) {
+            for (relaxed in relaxedSearchQueries(query)) {
+                val extra = runCatching { webSearch(relaxed, 1) }.getOrNull() ?: continue
+                combined = mergeSeries(combined, extra.items)
+                if (hasTitleMatch(combined, query)) break
+            }
+        }
+
+        val newReleaseIds = hashSetOf<String>()
+        if (normalizeSearchText(query).length >= 2 && !hasExactTitleMatch(combined, query)) {
+            val extras = searchNewReleases(query)
+            if (extras.isNotEmpty()) {
+                extras.forEach { newReleaseIds += it.id }
+                combined = mergeSeries(combined, extras)
+            }
+        }
+
+        val ranked = rankSearchResults(combined, query, newReleaseIds)
+        val hasMore = webResult?.hasMore ?: appResult?.hasMore ?: false
+        if (webResult != null && webResult.hasMore) {
+            saveSearchCursor(type, query, 1, SearchCursor("", "", null, clock(), "web"))
+        }
+        return CatalogPage(ranked, hasMore)
     }
     fun hotSearches(): List<String> = listOf(
         "短剧最热榜前十名", "都市逆袭", "战神归来", "甜宠", "神医下山", "穿越剧大全",
@@ -359,16 +629,33 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
         return SeriesSeasons.siblings(series.title, all)
     }
 
+    private class EmptySearchResponseException : IOException("搜索接口暂不可用")
+    private class ComicTabUnavailableException : IOException("漫剧搜索暂不可用")
+
+    private fun appSearchWithRenewal(keyword: String, page: Int, type: ContentType): CatalogPage {
+        fun call(targetType: ContentType): CatalogPage {
+            return try {
+                appSearch(keyword, page, targetType)
+            } catch (_: EmptySearchResponseException) {
+                registerDevice()
+                appSearch(keyword, page, targetType)
+            }
+        }
+        if (type != ContentType.COMIC) return call(type)
+        return try {
+            val res = call(ContentType.COMIC)
+            if (res.items.isNotEmpty() || page > 1) res else call(ContentType.SHORT)
+        } catch (_: ComicTabUnavailableException) {
+            call(ContentType.SHORT)
+        }
+    }
+
     private fun appSearch(keyword: String, page: Int, type: ContentType): CatalogPage {
         val values=LinkedHashMap(deviceProfile())
         for(k in listOf("version_code","manifest_version_code","update_version_code","pv_player")) values[k]="72232"
         values["version_name"]="7.2.2.32"
         values.putAll(linkedMapOf("query" to keyword,"count" to "20","offset" to ((page-1)*20).toString(),"tab_type" to type.searchTab.toString(),"bookshelf_search_plan" to "4","use_correct" to "true","user_is_login" to "0"))
-        val cursor=synchronized(searchCursors) {
-            val now=clock()
-            searchCursors.entries.removeAll { now-it.value.updatedAt>300000 || (page==1 && it.key.first==type && it.key.second==keyword) }
-            searchCursors[Triple(type,keyword,page-1)]
-        }
+        val cursor = getSearchCursor(type, keyword, page)
         if(type==ContentType.COMIC && page>1 && cursor==null) throw SearchSessionExpiredException()
         cursor?.let {
             if(it.searchId.isNotBlank()) values["search_id"]=it.searchId
@@ -377,11 +664,13 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
         }
         val signed=signer.sign("https://api5-normal-sinfonlinea.fqnovel.com/reading/bookapi/search/tab/v",values)
         val rawText=text(signed.url,signed).trim()
-        if(rawText.isEmpty() || !rawText.startsWith("{")) throw IOException("搜索接口暂不可用")
+        if(rawText.isEmpty()) throw EmptySearchResponseException()
+        if(!rawText.startsWith("{")) throw IOException("搜索接口暂不可用")
         val data=JSONObject(rawText)
         if(data.optInt("code",-1)!=0) throw IOException("搜索接口暂不可用")
         val tabs=data.optJSONArray("search_tabs") ?: data.optJSONObject("data")?.optJSONArray("search_tabs") ?: throw IOException("搜索格式异常")
-        val tab=tabs.objects().firstOrNull { it.optInt("tab_type")==type.searchTab } ?: throw IOException("${type.label}搜索暂不可用")
+        val tab=tabs.objects().firstOrNull { it.optInt("tab_type")==type.searchTab }
+            ?: if (type == ContentType.COMIC) throw ComicTabUnavailableException() else throw IOException("${type.label}搜索暂不可用")
         val list=mutableListOf<Series>()
         for(cell in (tab.optJSONArray("data") ?: JSONArray()).objects()) {
             val cells=mutableListOf(cell)
@@ -389,7 +678,7 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
             for(row in cells) {
                 val video=row.optJSONArray("video_data")?.objects()?.firstOrNull() ?: continue
                 val id=video.str("series_id").ifEmpty { row.str("book_id").ifEmpty { row.str("search_result_id") } }
-                val title=row.optJSONObject("search_high_light")?.optJSONObject("title")?.str("text").orEmpty().ifEmpty { video.str("title").ifEmpty { row.str("cell_name") } }
+                val title=cleanSearchTitle(row.optJSONObject("search_high_light")?.optJSONObject("title")?.str("text").orEmpty().ifEmpty { video.str("title").ifEmpty { row.str("cell_name") } })
                 val count=video.optInt("episode_cnt")
                 val vertical=if(video.has("vertical")) video.optBoolean("vertical") else null
                 val isLandscape=if(vertical!=null) !vertical else null
@@ -405,16 +694,13 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
                 }.getOrDefault("")
                 list+=Series(
                     id,title,normalizeCoverUrl(video.str("cover").ifEmpty { video.str("cover_url") }),
-                    video.str("video_desc").ifEmpty { detailObj?.str("series_intro").orEmpty() },
+                    cleanSearchTitle(video.str("video_desc").ifEmpty { detailObj?.str("series_intro").orEmpty() }),
                     if(count>0) "全 $count 集" else video.str("rec_text"),
                     video.str("sub_title").ifEmpty { parsedTags },isAi=isAi,isLandscape=isLandscape
                 ).also(SeriesMediaTrait::recordSeriesMetadata)
             }
         }
-        synchronized(searchCursors) {
-            searchCursors[Triple(type,keyword,page)]=SearchCursor(tab.str("search_id"),tab.str("passback"),tab.str("next_offset").toIntOrNull(),clock())
-            while(searchCursors.size>100) searchCursors.remove(searchCursors.keys.first())
-        }
+        saveSearchCursor(type, keyword, page, SearchCursor(tab.str("search_id"),tab.str("passback"),tab.str("next_offset").toIntOrNull(),clock(), "app"))
         return CatalogPage(valid(list),tab.optBoolean("has_more",false) && page<100)
     }
     fun detail(id: String): Detail {
@@ -426,50 +712,33 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
             MediaSource.HONGGUO -> {}
         }
         require(id.matches(Regex("[0-9]{1,30}")))
-        val o=router("$site/detail?series_id=$id").optJSONObject("detail_page")?.optJSONObject("seriesDetail") ?: throw IOException("剧集详情暂不可用")
-        val raw=o.optJSONArray("vid_list") ?: throw IOException("分集暂不可用")
-        val episodes=(0 until raw.length()).map { raw.getString(it) }
-        if(episodes.isEmpty() || episodes.any { !it.matches(Regex("[0-9]{1,30}")) } || episodes.distinct().size!=episodes.size) throw IOException("分集数据异常")
-        return Detail(card(o).copy(id=id),episodes)
+        val candidates = listOf(
+            "$site/detail?series_id=$id" to listOf("detail_page"),
+            "$site/player/$id" to listOf("player_(series_id)/page", "player_(series_id)/(vid)/page", "detail_page")
+        )
+        var lastError: IOException? = null
+        for ((url, keys) in candidates) {
+            try {
+                val loaderData = router(url)
+                val o = keys.asSequence().mapNotNull { loaderData.optJSONObject(it)?.optJSONObject("seriesDetail") }.firstOrNull()
+                    ?: throw IOException("剧集详情暂不可用")
+                val raw = o.optJSONArray("vid_list") ?: throw IOException("分集暂不可用")
+                val episodes = (0 until raw.length()).map { raw.getString(it) }
+                if (episodes.isEmpty() || episodes.any { !it.matches(Regex("[0-9]{1,30}")) } || episodes.distinct().size != episodes.size) {
+                    throw IOException("分集数据异常")
+                }
+                return Detail(card(o).copy(id = id), episodes)
+            } catch (e: IOException) {
+                lastError = e
+            }
+        }
+        throw lastError ?: IOException("剧集详情暂不可用")
     }
     private class EmptyModelResponseException : IOException("播放接口暂不可用（空响应）")
     private class DeviceRegistrationRefusedException(message: String) : IOException(message)
 
-    private fun registerDeviceOrThrowRefusal(): DeviceRegister.Registered? {
-        val device = LinkedHashMap(registerProfile).apply { putAll(deviceIdentity) }
-        val body = DeviceRegister.payload(device)
-        val headers = DeviceRegister.headers(body, device)
-        val result = runCatching {
-            val request = Request.Builder().url(DeviceRegister.url())
-            headers.forEach { (key, value) -> request.header(key, value) }
-            request.post(body.toRequestBody("application/octet-stream".toMediaType()))
-            RequestScope.execute(http.newCall(request.build())) { response ->
-                if (!response.isSuccessful) {
-                    if (response.code in listOf(403, 429)) {
-                        throw DeviceRegistrationRefusedException("设备注册被限制（HTTP ${response.code}）")
-                    }
-                    throw IOException("设备注册失败（HTTP ${response.code}）")
-                }
-                val bytes = response.body?.bytes() ?: throw IOException("设备注册响应为空")
-                val raw = String(bytes, Charsets.UTF_8)
-                val json = runCatching { JSONObject(raw) }.getOrNull()
-                if (json != null && json.optInt("code", json.optInt("Code", 0)) != 0) {
-                    throw DeviceRegistrationRefusedException("设备注册被服务端拒绝")
-                }
-                DeviceRegister.parse(raw, response.headers("Set-Cookie"))
-                    ?: throw IOException("设备注册被服务端拒绝")
-            }
-        }
-        val ex = result.exceptionOrNull()
-        if (ex is DeviceRegistrationRefusedException) throw ex
-        val registered = result.getOrNull()
-        if (registered != null) {
-            deviceIdentity = linkedMapOf("device_id" to registered.deviceId, "iid" to registered.installId)
-            registrationCookies = LinkedHashMap(registrationCookies).apply { putAll(registered.cookies) }
-            onDeviceRegistered?.invoke(registered)
-        }
-        return registered
-    }
+    private fun registerDeviceOrThrowRefusal(): DeviceRegister.Registered? =
+        executeDeviceRegistration(throwOnRefusal = true)
 
     internal fun buildPlaybackRequest(
         id: String,
@@ -638,6 +907,31 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
         else -> 1
     }
 
+    private fun collectStreamUrls(obj: JSONObject, seed: ByteArray? = null): List<String> {
+        val rawCandidates = mutableListOf<String>()
+        for (key in listOf("main_url", "backup_url", "backup_url_1")) {
+            obj.str(key).takeIf { it.isNotEmpty() }?.let { rawCandidates += it }
+        }
+        obj.optJSONArray("backup_url_list")?.let { arr ->
+            for (i in 0 until arr.length()) {
+                arr.optString(i, "").trim().takeIf { it.isNotEmpty() }?.let { rawCandidates += it }
+            }
+        }
+        val urls = linkedSetOf<String>()
+        for (raw in rawCandidates) {
+            val cleaned = cleanUrl(raw)
+            val resolved = if (seed != null && seed.isNotEmpty()) {
+                runCatching { MediaCrypto.decryptUrl(cleaned, seed) }.getOrNull().orEmpty()
+            } else {
+                cleaned
+            }
+            if (resolved.startsWith("https://") || resolved.startsWith("http://")) {
+                urls += resolved
+            }
+        }
+        return urls.toList()
+    }
+
     private fun parseModelStreams(model: JSONObject, maxQuality: Int): StreamInfo? {
         var hasIncompatible = false
         val rawVideoList = model.opt("video_list")
@@ -647,11 +941,11 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
             else -> emptyList()
         }
         if (inlineObjects.isNotEmpty()) {
-            data class PreloadRow(val quality: Int, val codecRank: Int, val url: String, val spadeA: String, val width: Int = 0, val height: Int = 0, val referer: String = "https://novel.snssdk.com/", val userAgent: String = VendorConstants.VIDEO_UA, val hls: Boolean = false)
+            data class PreloadRow(val quality: Int, val codecRank: Int, val urls: List<String>, val spadeA: String, val width: Int = 0, val height: Int = 0, val referer: String = "https://novel.snssdk.com/", val userAgent: String = VendorConstants.VIDEO_UA, val hls: Boolean = false)
             val rows = mutableListOf<PreloadRow>()
             for (v in inlineObjects) {
-                val mainUrl = cleanUrl(v.str("main_url"))
-                if (mainUrl.isEmpty() || (!mainUrl.startsWith("http://") && !mainUrl.startsWith("https://"))) continue
+                val urls = collectStreamUrls(v)
+                if (urls.isEmpty()) continue
                 val meta = v.optJSONObject("video_meta") ?: v
                 val codec = meta.str("codec_type").ifEmpty { v.str("codec_type") }.lowercase()
                 if (codec in setOf("bytevc2", "bvc2")) {
@@ -674,14 +968,14 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
                     .ifEmpty { v.str("quality_desc") }
                     .ifEmpty { v.str("definition") }
                 val qNum = if (height > 0) height else qualityNumber(defStr)
-                rows += PreloadRow(qNum, codecRank(codec), mainUrl, spadeA, width, height)
+                rows += PreloadRow(qNum, codecRank(codec), urls, spadeA, width, height)
             }
             if (rows.isNotEmpty()) {
                 val sorted = rows.sortedWith(compareByDescending<PreloadRow> { it.quality }.thenBy { it.codecRank })
                 val selected = sorted.firstOrNull { it.quality <= maxQuality } ?: sorted.last()
                 val key = selected.spadeA.takeIf { it.isNotEmpty() }?.let(MediaCrypto::deriveKey)
                 val qualityDesc = if (selected.quality > 0) "${selected.quality}P" + (if (selected.quality > maxQuality) "（兼容资源）" else "") else "自动"
-                return StreamInfo(selected.url, key, qualityDesc, selected.width, selected.height)
+                return StreamInfo(selected.urls.first(), key, qualityDesc, selected.width, selected.height, backupUrls = selected.urls.drop(1))
             }
         }
 
@@ -707,7 +1001,7 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
                         hasIncompatible = true
                         false
                     } else {
-                        it.second.str("main_url").isNotEmpty()
+                        it.second.str("main_url").isNotEmpty() || it.second.str("backup_url").isNotEmpty()
                     }
                 }.map { (k, o) ->
                     val qNum = qualityNumber(o.str("quality_desc").ifEmpty { o.str("height").ifEmpty { o.str("vheight").ifEmpty { o.str("quality").ifEmpty { k } } } })
@@ -715,15 +1009,15 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
                 }.sortedWith(compareByDescending<Triple<Int, Int, JSONObject>> { it.first }.thenBy { it.second }).toList()
                 val selected = rows.firstOrNull { it.first <= maxQuality } ?: rows.lastOrNull() ?: continue
                 val item = selected.third
-                var url = cleanUrl(item.str("main_url"))
                 val seed = info.str("key_seed")
-                if (seed.isNotEmpty()) url = MediaCrypto.decryptUrl(url, decode64(seed))
-                if (!url.startsWith("https://") && !url.startsWith("http://")) throw IOException("播放地址无效")
+                val seedBytes = if (seed.isNotEmpty()) decode64(seed) else null
+                val urls = collectStreamUrls(item, seedBytes)
+                if (urls.isEmpty()) throw IOException("播放地址无效")
                 val key = item.str("spade_a").takeIf { it.isNotEmpty() }?.let(MediaCrypto::deriveKey)
                 val quality = if (selected.first > 0) "${selected.first}P" + (if (selected.first > maxQuality) "（兼容资源）" else "") else "自动"
                 val width = item.optInt("vwidth", 0)
                 val height = item.optInt("vheight", 0)
-                return StreamInfo(url, key, quality, width, height)
+                return StreamInfo(urls.first(), key, quality, width, height, backupUrls = urls.drop(1))
             }
         }
         if (hasIncompatible) {

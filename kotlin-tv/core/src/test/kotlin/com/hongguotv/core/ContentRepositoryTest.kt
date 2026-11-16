@@ -393,60 +393,61 @@ class ContentRepositoryTest {
         val repo = repository { request ->
             requests += request
             when (request.url.encodedPath) {
-                "/reading/bookapi/video_tab/multi_video_model/v1/" -> {
-                    assertEquals("GET", request.method)
-                    assertEquals("73932", request.url.queryParameter("version_code"))
-                    assertEquals("7.3.9.32", request.url.queryParameter("version_name"))
-                    assertEquals("7700946421087751193", request.url.queryParameter("video_id"))
+                "/novel/player/multi_video_model/player/v1" -> {
+                    assertEquals("POST", request.method)
+                    assertEquals("74332", request.url.queryParameter("version_code"))
+                    assertEquals("7.4.3.32", request.url.queryParameter("version_name"))
+                    assertEquals("vivo_8662_64", request.url.queryParameter("channel"))
+                    assertEquals("PGT-AN10", request.url.queryParameter("device_type"))
+                    assertEquals("12", request.url.queryParameter("os_version"))
+                    assertTrue(request.url.queryParameter("cdid").orEmpty().isNotBlank())
                     assertNull(request.header("x-gorgon"))
-                    assertNull(request.header("x-medusa"))
-                    assertNull(request.header("x-helios"))
-                    assertNull(request.header("x-ss-stub"))
-                    assertTrue(decode64(request.header("x-argus").orEmpty()).size > 4)
-                    assertTrue(decode64(request.header("x-ladon").orEmpty()).size > 4)
-                    ""
+                    assertNull(request.header("x-argus"))
+                    assertNull(request.header("x-ladon"))
+                    assertTrue(request.header("x-khronos").orEmpty().isNotBlank())
+                    assertTrue(request.header("x-helios").orEmpty().isNotBlank())
+                    assertTrue(request.header("x-medusa").orEmpty().isNotBlank())
+                    assertEquals("gzip", request.header("Content-Encoding"))
+                    val buffer = okio.Buffer()
+                    request.body!!.writeTo(buffer)
+                    val rawGzip = buffer.readByteArray()
+                    assertEquals(digest("MD5", rawGzip).hex().uppercase(), request.header("x-ss-stub"))
+                    val gunzipped = java.util.zip.GZIPInputStream(rawGzip.inputStream()).readBytes().toString(Charsets.UTF_8)
+                    val payload = JSONObject(gunzipped)
+                    assertEquals("player", payload.getString("dr_scene"))
+                    assertEquals(1, payload.getJSONObject("biz_param").getInt("device_level"))
+                    assertEquals("7700946421087751193", payload.getJSONObject("mixed_video_id_map").getJSONArray("1004").getString(0))
+                    if (request.url.queryParameter("device_id") == "111222333") {
+                        ""
+                    } else {
+                        assertEquals("9007199254740993", request.url.queryParameter("device_id"))
+                        JSONObject().put("code", 0).put("data", JSONObject().put(
+                            "1004", JSONObject().put(
+                                "7700946421087751193", JSONObject().put(
+                                    "video_model", JSONObject()
+                                        .put("video_id", "vid-770")
+                                        .put("video_duration", 60.0)
+                                        .put("video_list", JSONObject().put(
+                                            "hd", JSONObject()
+                                                .put("codec_type", "h264")
+                                                .put("vwidth", 1080)
+                                                .put("vheight", 1920)
+                                                .put("quality_desc", "1080p")
+                                                .put("main_url", "https://qznovelvod.com/synthetic-tab.mp4")
+                                                .put("encrypt_info", JSONObject().put("encrypt", false))
+                                        ))
+                                )
+                            )
+                        )).toString()
+                    }
                 }
                 "/service/2/device_register/" -> {
                     JSONObject().put("device_id_str", "9007199254740993").put("install_id_str", "9007199254741993").toString()
                 }
-                "/novel/player/multi_video_model/v1/" -> {
-                    assertEquals("POST", request.method)
-                    assertEquals("74332", request.url.queryParameter("version_code"))
-                    assertEquals("7.4.3.32", request.url.queryParameter("version_name"))
-                    assertEquals("9007199254740993", request.url.queryParameter("device_id"))
-                    assertEquals("gzip", request.header("Content-Encoding"))
-                    assertNull(request.header("x-gorgon"))
-                    assertNull(request.header("x-medusa"))
-                    assertNull(request.header("x-helios"))
-                    assertTrue(decode64(request.header("x-argus").orEmpty()).size > 4)
-                    assertTrue(decode64(request.header("x-ladon").orEmpty()).size > 4)
-                    val buffer = okio.Buffer()
-                    request.body!!.writeTo(buffer)
-                    val rawGzip = buffer.readByteArray()
-                    assertEquals(digest("MD5", rawGzip).hex(), request.header("x-ss-stub"))
-                    val gunzipped = java.util.zip.GZIPInputStream(rawGzip.inputStream()).readBytes().toString(Charsets.UTF_8)
-                    val payload = JSONObject(gunzipped)
-                    assertEquals("7700946421087751193", payload.getJSONObject("mixed_video_id_map").getJSONArray("1004").getString(0))
-                    JSONObject().put("code", 0).put("data", JSONObject().put(
-                        "7700946421087751193", JSONObject().put(
-                            "video_model", JSONObject()
-                                .put("video_id", "vid-770")
-                                .put("video_duration", 60.0)
-                                .put("video_list", JSONObject().put(
-                                    "hd", JSONObject()
-                                        .put("codec_type", "h264")
-                                        .put("vwidth", 1080)
-                                        .put("vheight", 1920)
-                                        .put("quality_desc", "1080p")
-                                        .put("main_url", "https://qznovelvod.com/synthetic-tab.mp4")
-                                        .put("encrypt_info", JSONObject().put("encrypt", false))
-                                ))
-                        )
-                    )).toString()
-                }
                 else -> error("Unexpected path: ${request.url.encodedPath}")
             }
         }
+        repo.deviceIdentity = mapOf("device_id" to "111222333", "iid" to "444555666")
         val stream = repo.stream("7700946421087751193", 1080)
         assertEquals("https://qznovelvod.com/synthetic-tab.mp4", stream.url)
         assertEquals("1920P（兼容资源）", stream.quality)
@@ -470,8 +471,9 @@ class ContentRepositoryTest {
                 }
             }.build()
         )
+        repo.deviceIdentity = mapOf("device_id" to "111222333", "iid" to "444555666")
         assertThrows(IOException::class.java) { repo.stream("7700946421087751193", 1080) }
-        assertEquals(listOf("/reading/bookapi/video_tab/multi_video_model/v1/", "/service/2/device_register/"), requests.map { it.url.encodedPath })
+        assertEquals(listOf("/novel/player/multi_video_model/player/v1", "/service/2/device_register/"), requests.map { it.url.encodedPath })
     }
 
     @Test fun appCategoryCatalogExtractsThemesNewTodayBadgeAndCursor() {

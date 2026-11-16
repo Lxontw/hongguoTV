@@ -65,6 +65,8 @@ class ContentRepository(
     private val clock: () -> Long = System::currentTimeMillis
 ) {
     private val signer = Signer(clock)
+    private val v5Signer = Signer(clock, mobileV5 = true)
+    @Volatile private var playbackCdid: String = java.util.UUID.randomUUID().toString()
     private val site = "https://hongguoduanju.com"
     private val xifan = XifanRepository(http)
     private val hema = HemaRepository(http)
@@ -101,7 +103,13 @@ class ContentRepository(
                 return null
             }
         }
-        val device=LinkedHashMap(registerProfile).apply { putAll(deviceIdentity) }
+        val cdid = deviceIdentity["cdid"]?.takeIf { it.isNotBlank() }
+            ?: registerProfile["cdid"]?.takeIf { it.isNotBlank() }
+            ?: playbackCdid
+        val device=LinkedHashMap(registerProfile).apply {
+            putAll(deviceIdentity)
+            put("cdid", cdid)
+        }
         val body=DeviceRegister.payload(device)
         val headers=DeviceRegister.headers(body,device)
         val result=runCatching {
@@ -131,7 +139,8 @@ class ContentRepository(
                 registrationFailures = 0
                 registrationCooldownUntil = 0L
             }
-            deviceIdentity=linkedMapOf("device_id" to registered.deviceId,"iid" to registered.installId)
+            playbackCdid = cdid
+            deviceIdentity=linkedMapOf("device_id" to registered.deviceId,"iid" to registered.installId,"cdid" to cdid)
             registrationCookies=LinkedHashMap(registrationCookies).apply { putAll(registered.cookies) }
             onDeviceRegistered?.invoke(registered)
             return registered
@@ -810,6 +819,40 @@ class ContentRepository(
         return Signer.Request(url, headers, bodyBytes)
     }
 
+    internal fun buildV5PlaybackRequest(
+        id: String,
+        host: String = "https://api5-normal-sinfonlinea.fqnovel.com",
+        stampMs: Long = clock()
+    ): Signer.Request {
+        val profile = deviceProfile()
+        val cdid = profile["cdid"]?.takeIf { it.isNotBlank() } ?: playbackCdid
+        val values = linkedMapOf(
+            "aid" to "8662",
+            "app_name" to "novelread",
+            "version_code" to "74332",
+            "version_name" to "7.4.3.32",
+            "channel" to "vivo_8662_64",
+            "device_platform" to "android",
+            "device_type" to "PGT-AN10",
+            "os_version" to "12",
+            "update_version_code" to "74332",
+            "iid" to profile.getValue("iid"),
+            "cdid" to cdid,
+            "device_id" to profile.getValue("device_id")
+        )
+        val payload = """{"biz_param":{"detail_page_version":0,"device_level":1,"disable_digg_stat":false,"disable_video_relate_book":false,"need_all_video_definition":true,"need_mp4_align":false,"use_os_player":false,"use_server_dns":false,"video_platform":1024},"mixed_video_id_map":{"1004":["$id"]},"dr_scene":"player"}"""
+        val bodyBytes = PlayerSigner.gzip(payload.toByteArray(Charsets.UTF_8))
+        val signed = v5Signer.signPlayback("$host/novel/player/multi_video_model/player/v1", values, bodyBytes, stampMs)
+        val headers = LinkedHashMap(signed.headers).apply {
+            put("User-Agent", VendorConstants.PLAYER_UA)
+            put("Accept", "application/json")
+            put("Content-Encoding", "gzip")
+            put("Content-Type", "application/json; charset=UTF-8")
+            put("x-ss-stub", digest("MD5", bodyBytes).hex().uppercase())
+        }
+        return Signer.Request(signed.url, headers, bodyBytes)
+    }
+
     private fun executePlaybackCandidate(request: Signer.Request, id: String): JSONObject {
         val response = text(request.url, request)
         if (response.isBlank()) throw EmptyModelResponseException()
@@ -820,22 +863,33 @@ class ContentRepository(
     }
 
     private fun videoModel(id: String): JSONObject {
-        val primaryHost = "https://api5-normal-sinfonlineb.fqnovel.com"
+        if (deviceIdentity["device_id"].isNullOrBlank() || deviceIdentity["iid"].isNullOrBlank()) {
+            registerDeviceOrThrowRefusal()
+        }
         val primaryAttempt = runCatching {
-            val signed = buildPlaybackRequest(id, useVideoTab = true, host = primaryHost)
-            executePlaybackCandidate(signed, id)
+            executePlaybackCandidate(buildV5PlaybackRequest(id), id)
         }
         primaryAttempt.getOrNull()?.let { return it }
         val primaryError = primaryAttempt.exceptionOrNull()
-        System.err.println("ContentRepository.videoModel primary video_tab failed: ${primaryError?.javaClass?.name}: ${primaryError?.message}")
+        System.err.println("ContentRepository.videoModel primary v5 player failed: ${primaryError?.javaClass?.name}: ${primaryError?.message}")
         if (primaryError !is EmptyModelResponseException) {
             throw (primaryError as? IOException ?: IOException(primaryError?.message ?: "播放接口暂不可用", primaryError))
         }
 
         registerDeviceOrThrowRefusal()
 
+        val v5Retry = runCatching {
+            executePlaybackCandidate(buildV5PlaybackRequest(id), id)
+        }
+        v5Retry.getOrNull()?.let { return it }
+        val retryError = v5Retry.exceptionOrNull()
+        System.err.println("ContentRepository.videoModel v5 retry failed: ${retryError?.javaClass?.name}: ${retryError?.message}")
+        if (retryError !is EmptyModelResponseException) {
+            throw (retryError as? IOException ?: IOException(retryError?.message ?: "播放接口暂不可用", retryError))
+        }
+
         val legacyAttempt = runCatching {
-            val signed = buildPlaybackRequest(id, useVideoTab = false, host = primaryHost)
+            val signed = buildPlaybackRequest(id, useVideoTab = false, host = "https://api5-normal-sinfonlineb.fqnovel.com")
             executePlaybackCandidate(signed, id)
         }
         legacyAttempt.getOrNull()?.let { return it }
@@ -847,12 +901,12 @@ class ContentRepository(
     private fun videoModelOf(data: JSONObject, expectedId: String = ""): JSONObject? {
         val root = data.optJSONObject("data") ?: return null
         model(root.opt("video_model"))?.let { return it }
-        val container = root.optJSONObject("video_model_data") ?: root
+        val container = root.optJSONObject("video_model_data") ?: root.optJSONObject("1004") ?: root
         if (expectedId.isNotEmpty()) {
             container.optJSONObject(expectedId)?.let { entry ->
                 model(entry.opt("video_model"))?.let { return it }
             }
-            if (root.has("video_model_data")) return null
+            if (root.has("video_model_data") || root.has("1004")) return null
         }
         val entry = container.keys().asSequence().mapNotNull { container.optJSONObject(it) }.firstOrNull() ?: return null
         return model(entry.opt("video_model"))

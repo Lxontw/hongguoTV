@@ -49,4 +49,29 @@ class SignerV5Test {
             assertNotEquals(signer.medusa(request.url, body, ts, first + ("device_id" to "789")), request.headers["x-medusa"])
         }
     }
+
+    @Test fun bodylessV5GetUsesEmptyMd5DigestWithoutBodyHeaders() {
+        val first = mapOf(
+            "device_id" to "123", "iid" to "456", "cdid" to "synthetic",
+            "version_name" to "7.4.3.32", "channel" to "vivo_8662_64",
+            "os_version" to "12", "device_type" to "PGT-AN10", "video_id" to "7706368114740448280",
+            "_rticket" to "1800000000000"
+        )
+        val signer = Signer({ 1800000000000 }, random = { 0.5 }, processNonce = "synthetic", mobileV5 = true)
+        val emptyMd5 = digest("MD5", ByteArray(0))
+        for (ts in 1800000000..1800000031) {
+            val request = signer.signPlayback("https://example.test/video_tab", first, null, ts.toLong() * 1000)
+            val url = request.url.toHttpUrl()
+            assertNull(request.body)
+            assertEquals(setOf("x-khronos", "x-helios", "x-medusa"), request.headers.keys)
+            assertNull(request.headers["Content-Type"])
+            assertNull(request.headers["x-ss-stub"])
+            assertNull(request.headers["x-ss-req-ticket"])
+            assertEquals(0, signer.branch(url.encodedQuery!!, null, ts))
+            assertEquals(ts.toString(), request.headers["x-khronos"])
+            assertEquals(signer.medusa(request.url, null, ts, first), request.headers["x-medusa"])
+            val f13 = signer.hashF13(sm3(url.encodedQuery!!.toByteArray(Charsets.UTF_8)), emptyMd5, ts)
+            assertEquals(20, f13.size)
+        }
+    }
 }

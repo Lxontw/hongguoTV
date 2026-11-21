@@ -83,6 +83,8 @@ class ContentRepository(
     private val registrationCooldownLock = Any()
     @Volatile private var registrationCooldownUntil = 0L
     @Volatile private var registrationFailures = 0
+    private val v5PostEmptyCooldownMs = 30_000L
+    @Volatile private var v5PostCooldownUntil = 0L
 
     @Volatile var deviceIdentity: Map<String,String> = emptyMap()
         set(value) { field=value.filterValues { it.isNotBlank() }; signer.updateDevice(deviceProfile()) }
@@ -90,6 +92,7 @@ class ContentRepository(
     fun inheritDevice(from: ContentRepository) {
         deviceIdentity=from.deviceIdentity
         registrationCookies=from.registrationCookies
+        v5PostCooldownUntil=from.v5PostCooldownUntil
     }
 
     @Volatile var registerProfile: Map<String,String> = emptyMap()
@@ -853,6 +856,49 @@ class ContentRepository(
         return Signer.Request(signed.url, headers, bodyBytes)
     }
 
+    internal fun buildV5VideoTabRequest(
+        id: String,
+        host: String = "https://api5-normal-sinfonlineb.fqnovel.com",
+        stampMs: Long = clock()
+    ): Signer.Request {
+        val profile = deviceProfile()
+        val cdid = profile["cdid"]?.takeIf { it.isNotBlank() } ?: playbackCdid
+        val values = linkedMapOf(
+            "aid" to "8662",
+            "app_name" to "novelread",
+            "version_code" to "74332",
+            "version_name" to "7.4.3.32",
+            "channel" to "vivo_8662_64",
+            "device_platform" to "android",
+            "device_type" to "PGT-AN10",
+            "os_version" to "12",
+            "update_version_code" to "74332",
+            "iid" to profile.getValue("iid"),
+            "cdid" to cdid,
+            "device_id" to profile.getValue("device_id"),
+            "video_id" to id,
+            "video_id_type" to "0",
+            "device_level" to "1",
+            "need_all_video_definition" to "1",
+            "need_mp4_align" to "0",
+            "use_os_player" to "0",
+            "video_platform" to "1024",
+            "source" to "0",
+            "from_video_id" to ""
+        )
+        val signed = v5Signer.signPlayback(
+            "$host/reading/bookapi/video_tab/multi_video_model/v1/",
+            values,
+            null,
+            stampMs
+        )
+        val headers = LinkedHashMap(signed.headers).apply {
+            put("User-Agent", VendorConstants.PLAYER_UA)
+            put("Accept", "application/json")
+        }
+        return Signer.Request(signed.url, headers, null)
+    }
+
     private fun executePlaybackCandidate(request: Signer.Request, id: String): JSONObject {
         val response = text(request.url, request)
         if (response.isBlank()) throw EmptyModelResponseException()
@@ -862,39 +908,53 @@ class ContentRepository(
         return videoModelOf(data, id) ?: throw IOException("播放接口暂不可用（没有播放模型）")
     }
 
+    private fun trySameIdentityPlayback(id: String, preferVideoTab: Boolean): JSONObject? {
+        val doors: List<Pair<String, () -> Signer.Request>> = if (preferVideoTab) {
+            listOf(
+                "v5-tab" to { buildV5VideoTabRequest(id) },
+                "v5-post" to { buildV5PlaybackRequest(id) }
+            )
+        } else {
+            listOf(
+                "v5-post" to { buildV5PlaybackRequest(id) },
+                "v5-tab" to { buildV5VideoTabRequest(id) }
+            )
+        }
+        for ((doorName, buildReq) in doors) {
+            val attempt = runCatching { executePlaybackCandidate(buildReq(), id) }
+            attempt.getOrNull()?.let { model ->
+                if (doorName == "v5-post") v5PostCooldownUntil = 0L
+                return model
+            }
+            val err = attempt.exceptionOrNull()
+            System.err.println("ContentRepository.videoModel $doorName failed: ${err?.javaClass?.name}: ${err?.message}")
+            if (err !is EmptyModelResponseException) {
+                throw (err as? IOException ?: IOException(err?.message ?: "播放接口暂不可用", err))
+            }
+            if (doorName == "v5-post") {
+                v5PostCooldownUntil = clock() + v5PostEmptyCooldownMs
+            }
+        }
+        return null
+    }
+
     private fun videoModel(id: String): JSONObject {
         if (deviceIdentity["device_id"].isNullOrBlank() || deviceIdentity["iid"].isNullOrBlank()) {
             registerDeviceOrThrowRefusal()
         }
-        val primaryAttempt = runCatching {
-            executePlaybackCandidate(buildV5PlaybackRequest(id), id)
-        }
-        primaryAttempt.getOrNull()?.let { return it }
-        val primaryError = primaryAttempt.exceptionOrNull()
-        System.err.println("ContentRepository.videoModel primary v5 player failed: ${primaryError?.javaClass?.name}: ${primaryError?.message}")
-        if (primaryError !is EmptyModelResponseException) {
-            throw (primaryError as? IOException ?: IOException(primaryError?.message ?: "播放接口暂不可用", primaryError))
-        }
+        val preferVideoTab = clock() < v5PostCooldownUntil
+        trySameIdentityPlayback(id, preferVideoTab)?.let { return it }
 
         registerDeviceOrThrowRefusal()
-
-        val v5Retry = runCatching {
-            executePlaybackCandidate(buildV5PlaybackRequest(id), id)
-        }
-        v5Retry.getOrNull()?.let { return it }
-        val retryError = v5Retry.exceptionOrNull()
-        System.err.println("ContentRepository.videoModel v5 retry failed: ${retryError?.javaClass?.name}: ${retryError?.message}")
-        if (retryError !is EmptyModelResponseException) {
-            throw (retryError as? IOException ?: IOException(retryError?.message ?: "播放接口暂不可用", retryError))
-        }
+        trySameIdentityPlayback(id, preferVideoTab = false)?.let { return it }
 
         val legacyAttempt = runCatching {
-            val signed = buildPlaybackRequest(id, useVideoTab = false, host = "https://api5-normal-sinfonlineb.fqnovel.com")
+            val signed = buildPlaybackRequest(id, useVideoTab = true, host = "https://api5-normal-sinfonlineb.fqnovel.com")
             executePlaybackCandidate(signed, id)
         }
         legacyAttempt.getOrNull()?.let { return it }
         val legacyError = legacyAttempt.exceptionOrNull()
-        System.err.println("ContentRepository.videoModel legacy fallback failed: ${legacyError?.javaClass?.name}: ${legacyError?.message}")
+        System.err.println("ContentRepository.videoModel legacy video_tab fallback failed: ${legacyError?.javaClass?.name}: ${legacyError?.message}")
         throw (legacyError as? IOException ?: IOException(legacyError?.message ?: "播放接口暂不可用", legacyError))
     }
 

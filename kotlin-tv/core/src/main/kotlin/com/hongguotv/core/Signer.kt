@@ -57,8 +57,12 @@ internal class Signer(
         return value
     }
     private fun iv(query: ByteArray, body: ByteArray, ts: Int) = getIv(getIv(getIv(0x20230928, query), body), le32(ts))
+    private fun bodyDigest(body: ByteArray?): ByteArray =
+        if (body != null) digest("MD5", body)
+        else if (mobileV5) digest("MD5", ByteArray(0))
+        else ByteArray(16)
     fun branch(query: String, body: ByteArray?, ts: Int): Int =
-        (iv(sm3(query.toByteArray()), body?.let { digest("MD5", it) } ?: ByteArray(16), ts) and 15)
+        (iv(sm3(query.toByteArray()), bodyDigest(body), ts) and 15)
             .let { if (mobileV5) { if (it == 12) 0 else 1 } else it % 3 }
     private fun sumMd5(data: ByteArray): Int {
         var check = 0x20220420
@@ -162,7 +166,7 @@ internal class Signer(
     }
     private fun medusaV5(url: String, body: ByteArray?, ts: Int, who: Map<String, String>): String {
         val query = sm3(url.substringAfter('?').toByteArray(Charsets.UTF_8))
-        val f13 = hashF13(query, body?.let { digest("MD5", it) } ?: ByteArray(16), ts)
+        val f13 = hashF13(query, bodyDigest(body), ts)
         val flags = ByteArray(8)
         val version = who["version_name"]?.takeIf { it.isNotBlank() } ?: "7.4.3.32"
         val deviceId = who["device_id"]?.takeIf { it.isNotBlank() } ?: deviceId()

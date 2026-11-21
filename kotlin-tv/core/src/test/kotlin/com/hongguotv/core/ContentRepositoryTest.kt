@@ -441,6 +441,7 @@ class ContentRepositoryTest {
                         )).toString()
                     }
                 }
+                "/reading/bookapi/video_tab/multi_video_model/v1/" -> ""
                 "/service/2/device_register/" -> {
                     JSONObject().put("device_id_str", "9007199254740993").put("install_id_str", "9007199254741993").toString()
                 }
@@ -453,7 +454,15 @@ class ContentRepositoryTest {
         assertEquals("1920P（兼容资源）", stream.quality)
         assertEquals(1080, stream.width)
         assertEquals(1920, stream.height)
-        assertEquals(3, requests.size)
+        assertEquals(
+            listOf(
+                "/novel/player/multi_video_model/player/v1",
+                "/reading/bookapi/video_tab/multi_video_model/v1/",
+                "/service/2/device_register/",
+                "/novel/player/multi_video_model/player/v1"
+            ),
+            requests.map { it.url.encodedPath }
+        )
     }
 
     @Test fun renewalRefusalStopsLegacyRecovery() {
@@ -473,7 +482,133 @@ class ContentRepositoryTest {
         )
         repo.deviceIdentity = mapOf("device_id" to "111222333", "iid" to "444555666")
         assertThrows(IOException::class.java) { repo.stream("7700946421087751193", 1080) }
-        assertEquals(listOf("/novel/player/multi_video_model/player/v1", "/service/2/device_register/"), requests.map { it.url.encodedPath })
+        assertEquals(
+            listOf(
+                "/novel/player/multi_video_model/player/v1",
+                "/reading/bookapi/video_tab/multi_video_model/v1/",
+                "/service/2/device_register/"
+            ),
+            requests.map { it.url.encodedPath }
+        )
+    }
+
+    @Test fun v5PostEmptyFallsBackToBodylessV5VideoTabAndCoolsDownFor30Seconds() {
+        var now = 1_700_000_000_000L
+        var v5PostShouldRecover = false
+        val requests = mutableListOf<Request>()
+        val modelJson = JSONObject()
+            .put("video_id", "vid-770")
+            .put("video_duration", 60.0)
+            .put(
+                "video_list",
+                JSONObject().put(
+                    "hd",
+                    JSONObject()
+                        .put("codec_type", "h264")
+                        .put("vwidth", 1080)
+                        .put("vheight", 1920)
+                        .put("quality_desc", "1080p")
+                        .put("main_url", "https://qznovelvod.com/video-tab-ok.mp4")
+                        .put("encrypt_info", JSONObject().put("encrypt", false))
+                )
+            )
+        val repo = repository({ now }) { request ->
+            requests += request
+            when (request.url.encodedPath) {
+                "/novel/player/multi_video_model/player/v1" -> {
+                    if (v5PostShouldRecover) {
+                        JSONObject().put(
+                            "code",
+                            0
+                        ).put(
+                            "data",
+                            JSONObject().put(
+                                "1004",
+                                JSONObject().put("7700946421087751193", JSONObject().put("video_model", modelJson))
+                            )
+                        ).toString()
+                    } else {
+                        ""
+                    }
+                }
+                "/reading/bookapi/video_tab/multi_video_model/v1/" -> {
+                    assertEquals("GET", request.method)
+                    assertNull(request.body)
+                    assertTrue(request.header("x-khronos").orEmpty().isNotBlank())
+                    assertTrue(request.header("x-helios").orEmpty().isNotBlank())
+                    assertTrue(request.header("x-medusa").orEmpty().isNotBlank())
+                    assertNull(request.header("Content-Type"))
+                    assertNull(request.header("Content-Encoding"))
+                    assertNull(request.header("x-ss-stub"))
+                    assertNull(request.header("x-ss-req-ticket"))
+                    assertNull(request.header("x-argus"))
+                    assertNull(request.header("x-ladon"))
+                    assertNull(request.header("x-gorgon"))
+                    assertEquals("7700946421087751193", request.url.queryParameter("video_id"))
+                    assertEquals("0", request.url.queryParameter("video_id_type"))
+                    assertEquals("1", request.url.queryParameter("device_level"))
+                    assertEquals("1", request.url.queryParameter("need_all_video_definition"))
+                    assertEquals("0", request.url.queryParameter("need_mp4_align"))
+                    assertEquals("0", request.url.queryParameter("use_os_player"))
+                    assertEquals("1024", request.url.queryParameter("video_platform"))
+                    assertEquals("0", request.url.queryParameter("source"))
+                    assertEquals("", request.url.queryParameter("from_video_id"))
+                    JSONObject().put(
+                        "code",
+                        0
+                    ).put(
+                        "data",
+                        JSONObject().put(
+                            "video_model_data",
+                            JSONObject().put(
+                                "7700946421087751193",
+                                JSONObject().put("video_model", modelJson.toString())
+                            )
+                        )
+                    ).toString()
+                }
+                else -> error("Unexpected path: ${request.url.encodedPath}")
+            }
+        }
+        repo.deviceIdentity = mapOf("device_id" to "111222333", "iid" to "444555666", "cdid" to "cdid-test-1")
+
+        // 1st call: V5 POST returns empty -> falls back to bodyless V5 video_tab GET (no registration)
+        val stream1 = repo.stream("7700946421087751193", 1080)
+        assertEquals("https://qznovelvod.com/video-tab-ok.mp4", stream1.url)
+        assertEquals(
+            listOf("/novel/player/multi_video_model/player/v1", "/reading/bookapi/video_tab/multi_video_model/v1/"),
+            requests.map { it.url.encodedPath }
+        )
+
+        // 2nd call within 30s cooldown: skips V5 POST and hits video_tab directly in 1 request
+        requests.clear()
+        now += 10_000L
+        val stream2 = repo.stream("7700946421087751193", 1080)
+        assertEquals("https://qznovelvod.com/video-tab-ok.mp4", stream2.url)
+        assertEquals(listOf("/reading/bookapi/video_tab/multi_video_model/v1/"), requests.map { it.url.encodedPath })
+
+        // 3rd call after 30s cooldown: probes V5 POST again, recovers, and clears cooldown
+        requests.clear()
+        now += 25_000L
+        v5PostShouldRecover = true
+        val stream3 = repo.stream("7700946421087751193", 1080)
+        assertEquals("https://qznovelvod.com/video-tab-ok.mp4", stream3.url)
+        assertEquals(listOf("/novel/player/multi_video_model/player/v1"), requests.map { it.url.encodedPath })
+    }
+
+    @Test fun v5BusinessRejectionDoesNotFallbackOrReregister() {
+        val requests = mutableListOf<Request>()
+        val repo = repository { request ->
+            requests += request
+            when (request.url.encodedPath) {
+                "/novel/player/multi_video_model/player/v1" ->
+                    JSONObject().put("code", 110001).put("message", "rejected").toString()
+                else -> error("Unexpected path: ${request.url.encodedPath}")
+            }
+        }
+        repo.deviceIdentity = mapOf("device_id" to "111222333", "iid" to "444555666")
+        assertThrows(IOException::class.java) { repo.stream("7700946421087751193", 1080) }
+        assertEquals(listOf("/novel/player/multi_video_model/player/v1"), requests.map { it.url.encodedPath })
     }
 
     @Test fun appCategoryCatalogExtractsThemesNewTodayBadgeAndCursor() {
